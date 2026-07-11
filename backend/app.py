@@ -310,24 +310,44 @@ def get_nodes():
     return jsonify(result)
 
 
+def _alert_sort_key(alert):
+    """Mongo alerts carry an ISO string timestamp, Pi alerts carry a unix
+    int — sorting the merged list on the raw field crashes with
+    TypeError: '<' not supported between instances of 'int' and 'str'.
+    Normalize both to a comparable unix float here."""
+    ts = alert.get("timestamp", 0)
+    if isinstance(ts, str):
+        try:
+            return datetime.fromisoformat(ts).timestamp()
+        except (ValueError, TypeError):
+            return 0
+    return ts or 0
+
+
 @app.route("/alerts", methods=["GET"])
 def get_alerts():
     limit = int(request.args.get("limit", 50))
-    
+
     #mongo
-    sim_alerts = list(
-        alerts_collection.find({}, {"_id": 0})
-        .sort("timestamp", -1)
-        .limit(limit)
-    )
-    for a in sim_alerts:
-        a["timestamp"] = a["timestamp"].isoformat()
-        
+    try:
+        sim_alerts = list(
+            alerts_collection.find({}, {"_id": 0})
+            .sort("timestamp", -1)
+            .limit(limit)
+        )
+        for a in sim_alerts:
+            a["timestamp"] = a["timestamp"].isoformat()
+    except Exception as e:
+        # Mongo Atlas unreachable/misconfigured — don't let the whole
+        # endpoint 500 just because the cloud side is down.
+        print(f"[mongo] /alerts fetch failed: {e}")
+        sim_alerts = []
+
     #pi
     pi_alerts = fetch_pi_alerts()
 
     combined = sim_alerts + pi_alerts
-    combined.sort(key=lambda a: a.get("timestamp", ""), reverse=True)
+    combined.sort(key=_alert_sort_key, reverse=True)
 
     return jsonify(combined[:limit])
 
