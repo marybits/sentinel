@@ -1,6 +1,3 @@
-// Mirrors the shape hub/main.c's GET /nodes will eventually return.
-// node_1 is the real ESP32 + HC-SR04 hardware; nodes 2-5 are simulated
-// by Julia's Flask backend (Iqaluit, Whitehorse, Resolute, Churchill).
 export const mockSensorData = [
   {
     node_id: "node_1",
@@ -64,7 +61,9 @@ export const mockSensorData = [
     distance_cm: null,
     proximity_alert: false,
     battery_pct: 47,
-    online: false,
-    last_seen: Math.floor(Date.now() / 1000) - 45,
+    online: true,
+    is_syncing: true,
+    sync_backlog: 42,
+    last_seen: Math.floor(Date.now() / 1000),
   },
 ];

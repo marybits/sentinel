@@ -24,6 +24,8 @@ export function getNodeStatus(node) {
   if (node.humidity_pct > HUMIDITY_HIGH_PCT) return "warning";
   if (node.battery_pct !== null && node.battery_pct < BATTERY_LOW_PCT) return "warning";
 
+  if (node.is_syncing) return "syncing";
+
   return "normal";
 }
 
@@ -33,6 +35,7 @@ export const STATUS_META = {
   critical: { label: "CRITICAL", dot: "bg-rose-500",    text: "text-rose-500" },
   alert:    { label: "ALERT",    dot: "bg-rose-500",    text: "text-rose-500" },
   offline:  { label: "OFFLINE",  dot: "bg-rose-500",    text: "text-rose-500" },
+  syncing:  { label: "SYNCING",  dot: "bg-cyan-500 animate-pulse", text: "text-cyan-500 animate-pulse" },
 };
 
 // Same palette as raw hex, for contexts that can't take Tailwind classes
@@ -43,4 +46,5 @@ export const STATUS_HEX = {
   critical: "#f43f5e",
   alert: "#f43f5e",
   offline: "#f43f5e",
+  syncing: "#06b6d4",
 };

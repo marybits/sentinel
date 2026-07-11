@@ -12,17 +12,18 @@ function Metric({ label, value }) {
 export default function NodeStatusCard({ node }) {
   const status = getNodeStatus(node);
   const meta = STATUS_META[status];
+  const label = status === "syncing" ? `SYNCING ${node.sync_backlog} PENDING...` : meta.label;
 
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-sm p-4 flex flex-col gap-3">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
         <div>
           <p className="font-mono text-xs text-slate-400 uppercase tracking-wider">{node.node_id}</p>
           <p className="text-slate-300 text-sm">{node.location}</p>
         </div>
         <div className="flex items-center gap-2">
           <span className={`h-2 w-2 rounded-full ${meta.dot}`} />
-          <span className={`font-mono text-xs uppercase tracking-widest ${meta.text}`}>{meta.label}</span>
+          <span className={`font-mono text-xs uppercase tracking-widest ${meta.text}`}>{label}</span>
         </div>
       </div>
 
