@@ -1,61 +1,24 @@
 /*
- * Sentinel Hub — hub/main.c
- * ---------------------------------------------------------------------------
- * Runs on the Raspberry Pi 5 under QNX 8.0 as the central base station for
- * the Sentinel Arctic sensor network (cuHacking).
+ * Sentinel Hub
  *
- * Responsibilities (per Phase 1 MVP):
- *   1. Listens for HTTP POST from ESP32 Node 1 (DHT11 temp/humidity) on
- *      port 8080 at /sensor-data (alias: /data).
- *   2. Polls the HC-SR04 ultrasonic sensor via GPIO every 500ms.
- *   3. When distance < 30cm, triggers the Pi Camera + an external OpenCV
- *      classifier process (person / object / none) and attaches the result
- *      to the resulting alert.
- *   4. Writes all telemetry to InfluxDB (port 8086) using HTTP line
- *      protocol.
- *   5. Exposes GET /nodes and GET /alerts for Julia's Flask backend /
- *      dashboard to poll.
+ * QNX 8.0 base station for the Sentinel Arctic sensor network (cuHacking).
+ * Receives ESP32/DHT11 readings over HTTP, polls an HC-SR04 over GPIO,
+ * triggers the camera + an OpenCV classifier on proximity alerts, persists
+ * everything to SQLite, and serves GET /nodes and GET /alerts for Flask.
  *
- * Build (on the Pi, via SSH):
- *      clang -Wall -Wextra -O2 -std=c11 -o hub main.c -lpthread
- *   (see hub/Makefile)
+ * Build:  clang -Wall -Wextra -O2 -std=c11 -o hub main.c -lpthread -lsqlite3
+ *         (see hub/Makefile)
+ * Run:    ./hub
  *
- * Run:
- *      INFLUX_TOKEN=xxxx ./hub
+ * Env vars:
+ *   SENTINEL_HTTP_PORT   HTTP port                (default 8080)
+ *   SENTINEL_DB_PATH     SQLite DB path            (default $HOME/sentinel/sentinel.db)
+ *   SENTINEL_GPIO_SIM    force simulated HC-SR04   (default 0, real GPIO)
+ *   SENTINEL_OPENCV_CMD  camera classifier command (default ./opencv_classify.py)
  *
- * Useful env vars (all optional, see CONFIG section below):
- *      SENTINEL_HTTP_PORT     default 8080
- *      INFLUX_HOST            default 127.0.0.1
- *      INFLUX_PORT            default 8086
- *      INFLUX_ORG             default "sentinel"
- *      INFLUX_BUCKET          default "sentinel"
- *      INFLUX_TOKEN           default "" (required for a real InfluxDB 2.x
- *                              instance — get it from `influx auth list`)
- *      SENTINEL_GPIO_SIM      default 0 — real HC-SR04 GPIO is used by
- *                              default (see GPIO section). Set to 1 to force
- *                              simulated distance readings (e.g. testing the
- *                              HTTP/InfluxDB/alerts pipeline off-hardware).
- *      SENTINEL_OPENCV_CMD    default "./opencv_classify.py"
- *
- * IMPORTANT — read before demo day:
- *   The GPIO section below talks to the real HC-SR04 over
- *   /dev/gpio23 (TRIG) and /dev/gpio24 (ECHO), confirmed present via
- *   `ls /dev/gpio*` on this Pi. The exact wire protocol of this
- *   QNX GPIO character-device driver isn't documented anywhere we have
- *   access to, so the implementation uses the most common convention for a
- *   one-device-per-pin GPIO driver: open() with O_WRONLY/O_RDONLY selects
- *   direction, and a single-byte read()/write() gets/sets the pin level
- *   (ASCII '0'/'1', with a raw binary 0/1 fallback on write). Sanity-check
- *   this against the real driver before relying on it for the demo:
- *
- *     echo 1 > /dev/gpio23 ; echo 0 > /dev/gpio23   # TRIG should toggle
- *     cat /dev/gpio24                                # ECHO should read back
- *
- *   If the driver behaves differently, adjust gpio_pin_write()/
- *   gpio_pin_read() in the GPIO section below. Either way,
- *   gpio_hw_init() falls back to SENTINEL_GPIO_SIM automatically if
- *   opening either device fails, so a wiring/driver problem degrades to a
- *   working simulated demo instead of a crash.
+ * GPIO note: talks to HC-SR04 over /dev/gpio23 (TRIG) / /dev/gpio24 (ECHO)
+ * using a best-effort read/write protocol (see gpio_pin_read/gpio_pin_write);
+ * falls back to SENTINEL_GPIO_SIM automatically if the devices won't open.
  */
 
 #include <stdio.h>
@@ -73,25 +36,16 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
-
-/* =========================================================================
- * CONFIG
- * ========================================================================= */
+#include <sqlite3.h>
 
 #define DEFAULT_HTTP_PORT        8080
-#define DEFAULT_INFLUX_HOST      "127.0.0.1"
-#define DEFAULT_INFLUX_PORT      8086
-#define DEFAULT_INFLUX_ORG       "sentinel"
-#define DEFAULT_INFLUX_BUCKET    "sentinel"
 #define DEFAULT_OPENCV_CMD       "./opencv_classify.py"
+#define DEFAULT_DB_SUBPATH       "/sentinel/sentinel.db" /* appended to $HOME */
 
 #define MAX_NODES                8
-#define MAX_ALERTS               200
 #define REQ_BUF_SIZE             8192
-#define LINE_BUF_SIZE            512
 
 #define PROXIMITY_THRESHOLD_CM   30.0
 #define TEMP_HIGH_C              35.0
@@ -99,25 +53,21 @@
 #define HUMIDITY_HIGH_PCT        80.0
 #define NODE_OFFLINE_SEC         10
 #define GPIO_POLL_INTERVAL_MS    500
-#define ALERT_COOLDOWN_SEC       15   /* dedupe: don't refire same alert type
-                                         for a node more often than this */
+#define ALERT_COOLDOWN_SEC       15 /* min seconds between repeats of the same alert */
 #define CAMERA_TIMEOUT_SEC       5
+#define ALERTS_RESPONSE_LIMIT    20
 
 static int   g_http_port      = DEFAULT_HTTP_PORT;
-static char  g_influx_host[128];
-static int   g_influx_port    = DEFAULT_INFLUX_PORT;
-static char  g_influx_org[64];
-static char  g_influx_bucket[64];
-static char  g_influx_token[256];
+static char  g_db_path[512];
 static char  g_opencv_cmd[256];
 static int   g_gpio_sim       = 1;
 
+static sqlite3          *g_db = NULL;
+static pthread_mutex_t   g_db_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static volatile sig_atomic_t g_shutdown = 0;
 
-/* =========================================================================
- * LOGGING
- * ========================================================================= */
-
+/* Timestamped log line to stderr. */
 static void log_line(const char *level, const char *fmt, ...) {
     char timebuf[32];
     time_t now = time(NULL);
@@ -137,10 +87,6 @@ static void log_line(const char *level, const char *fmt, ...) {
 #define LOG_WARN(...)  log_line("WARN", __VA_ARGS__)
 #define LOG_ERR(...)   log_line("ERROR", __VA_ARGS__)
 
-/* =========================================================================
- * SHARED STATE: NODES
- * ========================================================================= */
-
 typedef struct {
     char   node_id[32];
     char   location[48];
@@ -158,8 +104,7 @@ typedef struct {
 static node_state_t   g_nodes[MAX_NODES];
 static pthread_mutex_t g_nodes_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Known field coordinates from the hackathon plan (used only as defaults
- * when a node reports without explicit lat/lon). */
+/* Known lat/lon per node_id, from the hackathon plan. */
 static void seed_known_location(const char *node_id, char *loc_out, size_t loc_sz,
                                  double *lat_out, double *lon_out) {
     if (strcmp(node_id, "node_1") == 0) {
@@ -177,8 +122,7 @@ static void seed_known_location(const char *node_id, char *loc_out, size_t loc_s
     }
 }
 
-/* Finds a node by id, or allocates a new slot. Returns NULL if the table
- * is full. Caller must hold g_nodes_lock. */
+/* Finds a node by id or allocates a free slot; caller holds g_nodes_lock. */
 static node_state_t *find_or_create_node_locked(const char *node_id) {
     int free_slot = -1;
     for (int i = 0; i < MAX_NODES; i++) {
@@ -197,12 +141,7 @@ static node_state_t *find_or_create_node_locked(const char *node_id) {
     return n;
 }
 
-/* =========================================================================
- * SHARED STATE: ALERTS  (simple ring buffer)
- * ========================================================================= */
-
 typedef struct {
-    long   id;
     char   node_id[32];
     char   type[32];        /* proximity_alert | temp_high | temp_low |
                                 humidity_high | node_offline */
@@ -211,13 +150,6 @@ typedef struct {
     time_t timestamp;
 } alert_t;
 
-static alert_t          g_alerts[MAX_ALERTS];
-static int               g_alert_count = 0;   /* number of valid entries */
-static int               g_alert_head  = 0;   /* next write index (ring) */
-static long               g_alert_next_id = 1;
-static pthread_mutex_t   g_alerts_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* Last time each (node_id, type) pair fired, for cooldown dedupe. */
 typedef struct {
     char   node_id[32];
     char   type[32];
@@ -227,6 +159,7 @@ static alert_cooldown_t g_cooldowns[MAX_NODES * 6];
 static int g_cooldown_count = 0;
 static pthread_mutex_t g_cooldown_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Rate-limits repeat alerts for the same (node_id, type) pair. */
 static int cooldown_ready(const char *node_id, const char *type) {
     time_t now = time(NULL);
     int ready = 1;
@@ -250,9 +183,9 @@ static int cooldown_ready(const char *node_id, const char *type) {
     return ready;
 }
 
-/* Forward decl */
-static void influx_write_alert_async(const alert_t *a);
+static void db_write_alert(const alert_t *a);
 
+/* Logs and persists an alert, subject to cooldown_ready(). */
 static void push_alert(const char *node_id, const char *type,
                         const char *classification, const char *fmt, ...) {
     if (!cooldown_ready(node_id, type)) return;
@@ -269,30 +202,11 @@ static void push_alert(const char *node_id, const char *type,
     vsnprintf(a.message, sizeof(a.message), fmt, ap);
     va_end(ap);
 
-    pthread_mutex_lock(&g_alerts_lock);
-    a.id = g_alert_next_id++;
-    g_alerts[g_alert_head] = a;
-    g_alert_head = (g_alert_head + 1) % MAX_ALERTS;
-    if (g_alert_count < MAX_ALERTS) g_alert_count++;
-    pthread_mutex_unlock(&g_alerts_lock);
-
     LOG_WARN("ALERT [%s] %s: %s", type, node_id, a.message);
-    influx_write_alert_async(&a);
+    db_write_alert(&a);
 }
 
-/* =========================================================================
- * TINY JSON HELPERS
- * ---------------------------------------------------------------------------
- * The ESP32 firmware sends small, flat JSON objects. Rather than pull in a
- * JSON library (apk availability during a hackathon is unpredictable), we
- * do minimal, defensive string scanning for known keys. This is NOT a
- * general-purpose JSON parser — it only needs to survive well-formed,
- * flat sensor payloads.
- * ========================================================================= */
-
-/* Finds "key" in a flat JSON object and returns a pointer to the character
- * right after the following colon, skipping whitespace. Returns NULL if
- * not found. */
+/* Returns a pointer to the value after "key": in a flat JSON object, or NULL. */
 static const char *json_find_value(const char *json, const char *key) {
     char pattern[64];
     snprintf(pattern, sizeof(pattern), "\"%s\"", key);
@@ -306,6 +220,7 @@ static const char *json_find_value(const char *json, const char *key) {
     return p;
 }
 
+/* Reads a numeric JSON field. */
 static int json_get_double(const char *json, const char *key, double *out) {
     const char *v = json_find_value(json, key);
     if (!v) return 0;
@@ -316,6 +231,7 @@ static int json_get_double(const char *json, const char *key, double *out) {
     return 1;
 }
 
+/* Reads a boolean JSON field. */
 static int json_get_bool(const char *json, const char *key, int *out) {
     const char *v = json_find_value(json, key);
     if (!v) return 0;
@@ -324,6 +240,7 @@ static int json_get_bool(const char *json, const char *key, int *out) {
     return 0;
 }
 
+/* Reads a string JSON field. */
 static int json_get_string(const char *json, const char *key, char *out, size_t out_sz) {
     const char *v = json_find_value(json, key);
     if (!v || *v != '"') return 0;
@@ -336,195 +253,144 @@ static int json_get_string(const char *json, const char *key, char *out, size_t 
     return 1;
 }
 
-/* =========================================================================
- * MINIMAL HTTP CLIENT  (used to talk to InfluxDB)
- * ========================================================================= */
-
-/* Connects, sends a raw HTTP/1.1 request, reads the response into `resp`
- * (best-effort, truncates at resp_sz). Returns 0 on success (request sent
- * and at least a status line read back), -1 on failure. */
-static int http_post_raw(const char *host, int port, const char *path,
-                          const char *extra_headers, const char *body,
-                          char *resp, size_t resp_sz) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { LOG_ERR("http_post_raw: socket() failed: %s", strerror(errno)); return -1; }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        LOG_ERR("http_post_raw: invalid host '%s'", host);
-        close(fd);
+/* Opens/creates the SQLite DB, schema, and WAL mode. */
+static int db_init(void) {
+    int rc = sqlite3_open(g_db_path, &g_db);
+    if (rc != SQLITE_OK) {
+        LOG_ERR("sqlite3_open(%s) failed: %s", g_db_path,
+                 g_db ? sqlite3_errmsg(g_db) : "unknown error");
         return -1;
     }
 
-    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    const char *schema =
+        "CREATE TABLE IF NOT EXISTS sensor_data ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  node_id TEXT NOT NULL,"
+        "  location TEXT,"
+        "  temperature REAL,"
+        "  humidity REAL,"
+        "  distance_cm REAL,"
+        "  proximity_alert INTEGER,"
+        "  timestamp INTEGER NOT NULL"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_sensor_data_node_ts "
+        "  ON sensor_data(node_id, timestamp);"
+        "CREATE TABLE IF NOT EXISTS alerts ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  node_id TEXT NOT NULL,"
+        "  type TEXT NOT NULL,"
+        "  message TEXT,"
+        "  classification TEXT,"
+        "  timestamp INTEGER NOT NULL"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(timestamp DESC);";
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        LOG_WARN("http_post_raw: connect to %s:%d failed: %s", host, port, strerror(errno));
-        close(fd);
+    char *errmsg = NULL;
+    rc = sqlite3_exec(g_db, schema, NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        LOG_ERR("sqlite3_exec(schema) failed: %s", errmsg ? errmsg : "unknown error");
+        sqlite3_free(errmsg);
         return -1;
     }
 
-    size_t body_len = body ? strlen(body) : 0;
-    char req[REQ_BUF_SIZE];
-    int n = snprintf(req, sizeof(req),
-        "POST %s HTTP/1.1\r\n"
-        "Host: %s:%d\r\n"
-        "%s"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        path, host, port, extra_headers ? extra_headers : "", body_len);
+    sqlite3_exec(g_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    sqlite3_exec(g_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
 
-    if (n < 0 || (size_t)n >= sizeof(req)) {
-        LOG_ERR("http_post_raw: request too large");
-        close(fd);
-        return -1;
-    }
-
-    if (send(fd, req, (size_t)n, 0) < 0 ||
-        (body_len > 0 && send(fd, body, body_len, 0) < 0)) {
-        LOG_WARN("http_post_raw: send() failed: %s", strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    size_t total = 0;
-    ssize_t r;
-    while (resp && total + 1 < resp_sz &&
-           (r = recv(fd, resp + total, resp_sz - 1 - total, 0)) > 0) {
-        total += (size_t)r;
-    }
-    if (resp) resp[total] = '\0';
-
-    close(fd);
+    LOG_INFO("SQLite database ready at %s", g_db_path);
     return 0;
 }
 
-/* =========================================================================
- * INFLUXDB WRITER  (HTTP line protocol, InfluxDB 2.x /api/v2/write style)
- * ========================================================================= */
-
-static void influx_write_line(const char *line) {
-    if (g_influx_token[0] == '\0') {
-        LOG_WARN("INFLUX_TOKEN not set — skipping InfluxDB write (line: %s)", line);
-        return;
-    }
-
-    char path[256];
-    snprintf(path, sizeof(path), "/api/v2/write?org=%s&bucket=%s&precision=s",
-             g_influx_org, g_influx_bucket);
-
-    char headers[512];
-    snprintf(headers, sizeof(headers),
-             "Authorization: Token %s\r\n"
-             "Content-Type: text/plain; charset=utf-8\r\n",
-             g_influx_token);
-
-    char resp[512];
-    if (http_post_raw(g_influx_host, g_influx_port, path, headers, line, resp, sizeof(resp)) != 0) {
-        LOG_WARN("InfluxDB write failed (network) — data kept in memory only, will retry on next reading");
-        return;
-    }
-    if (strstr(resp, "204") == NULL && strstr(resp, "200") == NULL) {
-        LOG_WARN("InfluxDB write may have failed, response: %.200s", resp);
+/* Closes the SQLite DB. */
+static void db_close(void) {
+    if (g_db) {
+        sqlite3_close(g_db);
+        g_db = NULL;
     }
 }
 
-/* Escapes spaces/commas in InfluxDB tag values (rudimentary — good enough
- * for our known node_id/location strings). */
-static void influx_escape_tag(const char *in, char *out, size_t out_sz) {
-    size_t j = 0;
-    for (size_t i = 0; in[i] && j + 2 < out_sz; i++) {
-        if (in[i] == ' ' || in[i] == ',' || in[i] == '=') out[j++] = '\\';
-        out[j++] = in[i];
+/* Inserts one sensor_data row for a node's current snapshot. */
+static void db_write_sensor_reading(const node_state_t *n) {
+    if (!g_db) return;
+    if (!n->has_temperature && !n->has_distance) return;
+
+    static const char *sql =
+        "INSERT INTO sensor_data "
+        "(node_id, location, temperature, humidity, distance_cm, proximity_alert, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?);";
+
+    pthread_mutex_lock(&g_db_lock);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        LOG_ERR("db_write_sensor_reading: prepare failed: %s", sqlite3_errmsg(g_db));
+        pthread_mutex_unlock(&g_db_lock);
+        return;
     }
-    out[j] = '\0';
-}
 
-static void influx_write_sensor_reading(const node_state_t *n) {
-    char loc_esc[96];
-    influx_escape_tag(n->location, loc_esc, sizeof(loc_esc));
-
-    char fields[256];
-    size_t off = 0;
-    fields[0] = '\0';
+    sqlite3_bind_text(stmt, 1, n->node_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, n->location, -1, SQLITE_TRANSIENT);
     if (n->has_temperature) {
-        off += (size_t)snprintf(fields + off, sizeof(fields) - off,
-                                 "temperature=%.2f,humidity=%.2f,", n->temperature_c, n->humidity_pct);
+        sqlite3_bind_double(stmt, 3, n->temperature_c);
+        sqlite3_bind_double(stmt, 4, n->humidity_pct);
+    } else {
+        sqlite3_bind_null(stmt, 3);
+        sqlite3_bind_null(stmt, 4);
     }
     if (n->has_distance) {
-        off += (size_t)snprintf(fields + off, sizeof(fields) - off,
-                                 "distance_cm=%.1f,proximity_alert=%s,",
-                                 n->distance_cm, n->proximity_alert ? "true" : "false");
+        sqlite3_bind_double(stmt, 5, n->distance_cm);
+        sqlite3_bind_int(stmt, 6, n->proximity_alert ? 1 : 0);
+    } else {
+        sqlite3_bind_null(stmt, 5);
+        sqlite3_bind_null(stmt, 6);
     }
-    if (off == 0) return; /* nothing to write yet */
-    if (off > 0 && fields[off - 1] == ',') fields[off - 1] = '\0'; /* trim trailing comma */
+    sqlite3_bind_int64(stmt, 7, (sqlite3_int64)time(NULL));
 
-    char line[LINE_BUF_SIZE];
-    snprintf(line, sizeof(line), "sensor_data,node_id=%s,location=%s %s %ld",
-             n->node_id, loc_esc, fields, (long)time(NULL));
-
-    influx_write_line(line);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        LOG_ERR("db_write_sensor_reading: step failed: %s", sqlite3_errmsg(g_db));
+    }
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_lock);
 }
 
-static void influx_write_alert_async(const alert_t *a) {
-    /* Kept synchronous-but-fast (single short-lived socket) for simplicity;
-       InfluxDB runs locally on the Pi so latency should be sub-millisecond.
-       If this ever needs to be non-blocking, move the call into its own
-       pthread here. */
-    char msg_esc[256];
-    influx_escape_tag(a->message, msg_esc, sizeof(msg_esc));
+/* Inserts one alerts row. */
+static void db_write_alert(const alert_t *a) {
+    if (!g_db) return;
 
-    char line[LINE_BUF_SIZE];
-    snprintf(line, sizeof(line),
-             "alerts,node_id=%s,type=%s message=\"%s\",classification=\"%s\" %ld",
-             a->node_id, a->type, msg_esc, a->classification, (long)a->timestamp);
-    influx_write_line(line);
+    static const char *sql =
+        "INSERT INTO alerts (node_id, type, message, classification, timestamp) "
+        "VALUES (?, ?, ?, ?, ?);";
+
+    pthread_mutex_lock(&g_db_lock);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        LOG_ERR("db_write_alert: prepare failed: %s", sqlite3_errmsg(g_db));
+        pthread_mutex_unlock(&g_db_lock);
+        return;
+    }
+
+    sqlite3_bind_text(stmt, 1, a->node_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, a->type, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, a->message, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, a->classification, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 5, (sqlite3_int64)a->timestamp);
+
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        LOG_ERR("db_write_alert: step failed: %s", sqlite3_errmsg(g_db));
+    }
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_lock);
 }
-
-/* =========================================================================
- * GPIO / HC-SR04
- * ---------------------------------------------------------------------------
- * Real backend, confirmed against this Pi's device layout
- * (`ls /dev/gpio*` -> /dev/gpio0 .. /dev/gpio27, plus /dev/gpio/msg):
- * TRIG is /dev/gpio23, ECHO is /dev/gpio24, one character device per pin.
- *
- * NOTE: HC-SR04's ECHO line is 5V logic — you need a voltage divider (or
- * logic-level shifter) down to 3.3V before it touches a Pi GPIO pin, or you
- * risk damaging the Pi's GPIO input.
- *
- * The exact wire protocol of this driver isn't documented anywhere we have
- * access to, so gpio_pin_write()/gpio_pin_read() below use the most common
- * convention for a one-device-per-pin GPIO character driver: open() with
- * O_WRONLY vs. O_RDONLY selects direction, and a single-byte read()/write()
- * gets/sets the pin level. Verify with the shell before fully trusting it:
- *
- *   echo 1 > /dev/gpio23 ; echo 0 > /dev/gpio23   # TRIG should toggle
- *   cat /dev/gpio24                                # ECHO should read back
- *
- * If that doesn't match reality, this is the only place to fix — the rest
- * of the pipeline (thresholds, alerts, InfluxDB, HTTP API) doesn't care how
- * gpio_read_distance_cm() gets its number. SENTINEL_GPIO_SIM=1 remains a
- * one-env-var fallback regardless.
- * ========================================================================= */
 
 #define GPIO_DEV_PATH_FMT       "/dev/gpio%d"
 #define GPIO_TRIG_PIN            23
 #define GPIO_ECHO_PIN            24
 
-#define HCSR04_TRIG_PULSE_US     10     /* datasheet minimum */
-#define HCSR04_ECHO_TIMEOUT_US   30000  /* ~30ms, comfortably covers ~500cm
-                                            round trip; also our "nothing in
-                                            range" bailout */
+#define HCSR04_TRIG_PULSE_US     10    /* datasheet minimum */
+#define HCSR04_ECHO_TIMEOUT_US   30000 /* ~30ms; also our "nothing in range" bailout */
 
 static int g_gpio_trig_fd = -1;
 static int g_gpio_echo_fd = -1;
 
+/* Opens /dev/gpio<pin>. */
 static int gpio_pin_open(int pin, int flags) {
     char path[32];
     snprintf(path, sizeof(path), GPIO_DEV_PATH_FMT, pin);
@@ -535,9 +401,7 @@ static int gpio_pin_open(int pin, int flags) {
     return fd;
 }
 
-/* Drives an output pin to logical 0/1. Tries ASCII '0'/'1' first (the
- * sysfs-style convention), falls back to a raw binary byte if that write
- * is rejected. Returns 0 on success, -1 on failure. */
+/* Drives an output pin to 0/1 (ASCII, falling back to a raw byte). */
 static int gpio_pin_write(int fd, int value) {
     char ascii = value ? '1' : '0';
     if (write(fd, &ascii, 1) == 1) return 0;
@@ -548,10 +412,7 @@ static int gpio_pin_write(int fd, int value) {
     return -1;
 }
 
-/* Samples an input pin's current logical level (0/1), or -1 on error.
- * lseek back to the start before each read — a standard idiom for polling
- * single-value character/sysfs-style device files repeatedly without
- * reopening; harmless if this particular driver doesn't need it. */
+/* Samples an input pin's current level (0/1), or -1 on error. */
 static int gpio_pin_read(int fd) {
     lseek(fd, 0, SEEK_SET);
     unsigned char b;
@@ -562,6 +423,7 @@ static int gpio_pin_read(int fd) {
     return b ? 1 : 0;
 }
 
+/* Opens the TRIG/ECHO GPIO devices. */
 static int gpio_hw_init(void) {
     g_gpio_trig_fd = gpio_pin_open(GPIO_TRIG_PIN, O_WRONLY);
     if (g_gpio_trig_fd < 0) return -1;
@@ -573,26 +435,26 @@ static int gpio_hw_init(void) {
         return -1;
     }
 
-    gpio_pin_write(g_gpio_trig_fd, 0); /* ensure TRIG idles low */
+    gpio_pin_write(g_gpio_trig_fd, 0);
 
     LOG_INFO("GPIO initialized: TRIG=/dev/gpio%d (fd=%d), ECHO=/dev/gpio%d (fd=%d)",
               GPIO_TRIG_PIN, g_gpio_trig_fd, GPIO_ECHO_PIN, g_gpio_echo_fd);
     return 0;
 }
 
+/* Closes the GPIO devices. */
 static void gpio_hw_cleanup(void) {
     if (g_gpio_trig_fd >= 0) { close(g_gpio_trig_fd); g_gpio_trig_fd = -1; }
     if (g_gpio_echo_fd >= 0) { close(g_gpio_echo_fd); g_gpio_echo_fd = -1; }
 }
 
+/* Microsecond delta between two timespecs. */
 static double timespec_diff_us(const struct timespec *start, const struct timespec *end) {
     return (double)(end->tv_sec - start->tv_sec) * 1e6 +
            (double)(end->tv_nsec - start->tv_nsec) / 1e3;
 }
 
-/* Pulses TRIG high for 10us, then times how long ECHO stays high
- * (microseconds), which is proportional to round-trip distance. Returns -1
- * on failure/timeout (e.g. nothing in range, or a wiring problem). */
+/* Pulses TRIG and times the ECHO response in microseconds, or -1 on timeout. */
 static double gpio_hw_read_echo_pulse_us(void) {
     if (g_gpio_trig_fd < 0 || g_gpio_echo_fd < 0) return -1.0;
 
@@ -604,7 +466,6 @@ static double gpio_hw_read_echo_pulse_us(void) {
     struct timespec t0, t_now, echo_start;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    /* Wait for ECHO to go high (start of the return pulse). */
     int level;
     do {
         level = gpio_pin_read(g_gpio_echo_fd);
@@ -613,7 +474,6 @@ static double gpio_hw_read_echo_pulse_us(void) {
     } while (level != 1);
     echo_start = t_now;
 
-    /* Wait for ECHO to go low again (end of the return pulse). */
     do {
         level = gpio_pin_read(g_gpio_echo_fd);
         clock_gettime(CLOCK_MONOTONIC, &t_now);
@@ -624,41 +484,28 @@ static double gpio_hw_read_echo_pulse_us(void) {
 }
 
 static int gpio_sim_seeded = 0;
+
+/* Simulated HC-SR04 reading, occasionally dipping under the alert threshold. */
 static double gpio_sim_next_distance_cm(void) {
     if (!gpio_sim_seeded) { srand((unsigned int)time(NULL)); gpio_sim_seeded = 1; }
-    /* Mostly far away (no intruder), occasionally dips under 30cm so the
-       alert + camera pipeline can be exercised end-to-end in simulation. */
     int roll = rand() % 100;
     if (roll < 8) {
-        return 5.0 + (rand() % 25); /* 5–29 cm: triggers proximity alert */
+        return 5.0 + (rand() % 25);
     }
-    return 60.0 + (rand() % 200); /* 60–259 cm: normal */
+    return 60.0 + (rand() % 200);
 }
 
-/* Returns distance in cm, or -1.0 on read failure. */
+/* Returns distance in cm (real or simulated), or -1.0 on read failure. */
 static double gpio_read_distance_cm(void) {
     if (g_gpio_sim) {
         return gpio_sim_next_distance_cm();
     }
     double pulse_us = gpio_hw_read_echo_pulse_us();
     if (pulse_us < 0) return -1.0;
-    /* Speed of sound ~343 m/s => 0.0343 cm/us; divide by 2 for round trip. */
-    return (pulse_us * 0.0343) / 2.0;
+    return (pulse_us * 0.0343) / 2.0; /* speed of sound, round trip */
 }
 
-/* =========================================================================
- * CAMERA + OPENCV TRIGGER
- * ---------------------------------------------------------------------------
- * Satisfies the QNX hard requirement to use open-source AI from
- * oss.qnx.com — we use OpenCV. Rather than link OpenCV's C++ API directly
- * into this hub (adds significant build complexity mid-hackathon), we
- * shell out to a small helper (hub/opencv_classify.py) that captures a
- * frame and prints one of: person | object | none. See that file for the
- * actual OpenCV usage.
- * ========================================================================= */
-
-/* Runs the classifier command with a timeout, returns malloc'd string
- * (caller frees) with the trimmed stdout, or NULL on failure/timeout. */
+/* Runs the OpenCV classifier command with a timeout, returns malloc'd stdout or NULL. */
 static char *run_classifier_with_timeout(const char *cmd, int timeout_sec) {
     FILE *fp = popen(cmd, "r");
     if (!fp) {
@@ -681,7 +528,6 @@ static char *run_classifier_with_timeout(const char *cmd, int timeout_sec) {
     }
     pclose(fp);
 
-    /* trim trailing whitespace/newline */
     size_t len = strlen(buf);
     while (len > 0 && isspace((unsigned char)buf[len - 1])) buf[--len] = '\0';
     if (len == 0) return NULL;
@@ -691,6 +537,7 @@ static char *run_classifier_with_timeout(const char *cmd, int timeout_sec) {
     return result;
 }
 
+/* Runs the camera/OpenCV classifier and pushes a proximity alert with the result. */
 static void trigger_camera_and_classify(const char *node_id, double distance_cm) {
     LOG_INFO("Perimeter breach on %s (%.1fcm) — triggering camera + OpenCV", node_id, distance_cm);
 
@@ -704,10 +551,7 @@ static void trigger_camera_and_classify(const char *node_id, double distance_cm)
     free(classification);
 }
 
-/* =========================================================================
- * THRESHOLD / ANOMALY DETECTION
- * ========================================================================= */
-
+/* Checks a node snapshot against temp/humidity/distance thresholds and fires alerts. */
 static void check_thresholds_and_alert(node_state_t *n) {
     if (n->has_temperature) {
         if (n->temperature_c > TEMP_HIGH_C) {
@@ -734,10 +578,6 @@ static void check_thresholds_and_alert(node_state_t *n) {
     }
 }
 
-/* =========================================================================
- * HTTP SERVER
- * ========================================================================= */
-
 typedef struct {
     char method[8];
     char path[256];
@@ -745,8 +585,7 @@ typedef struct {
     size_t content_length;
 } http_request_t;
 
-/* strcasestr isn't guaranteed available on every libc (including some QNX
- * configurations) — small local implementation used below. */
+/* Case-insensitive strstr, since strcasestr isn't guaranteed on every libc. */
 static char *strcasestr_local(const char *haystack, const char *needle) {
     size_t nlen = strlen(needle);
     for (const char *p = haystack; *p; p++) {
@@ -755,9 +594,7 @@ static char *strcasestr_local(const char *haystack, const char *needle) {
     return NULL;
 }
 
-/* Very small HTTP/1.1 request reader: reads until it has the header block,
- * parses Content-Length, then reads that many more body bytes. Good enough
- * for small JSON POSTs and header-only GETs from Flask/ESP32. */
+/* Reads headers + body of one HTTP/1.1 request. */
 static int http_read_request(int fd, http_request_t *req) {
     char buf[REQ_BUF_SIZE];
     size_t total = 0;
@@ -800,6 +637,7 @@ static int http_read_request(int fd, http_request_t *req) {
     return 0;
 }
 
+/* Writes an HTTP response with headers + body. */
 static void http_send_response(int fd, int status, const char *status_text,
                                 const char *content_type, const char *body) {
     char header[256];
@@ -816,21 +654,16 @@ static void http_send_response(int fd, int status, const char *status_text,
     if (body_len > 0) send(fd, body, body_len, 0);
 }
 
+/* Writes an HTTP response with a JSON body. */
 static void http_send_json(int fd, int status, const char *status_text, const char *json_body) {
     http_send_response(fd, status, status_text, "application/json", json_body);
 }
 
-/* -------------------------------------------------------------------------
- * Route: POST /sensor-data  (alias: /data)
- * Expects a flat JSON body from ESP32 Node 1, e.g.:
- *   {"node_id":"node_1","temperature":22.4,"humidity":65,"distance_cm":120}
- * "location" is optional; known node_ids fall back to their documented
- * Arctic coordinates.
- * ---------------------------------------------------------------------- */
+/* POST /sensor-data (alias /data): ingests an ESP32 reading, checks thresholds, persists it. */
 static void handle_post_sensor_data(int fd, const http_request_t *req) {
     char node_id[32];
     if (!json_get_string(req->body, "node_id", node_id, sizeof(node_id))) {
-        snprintf(node_id, sizeof(node_id), "node_1"); /* MVP default: only real node */
+        snprintf(node_id, sizeof(node_id), "node_1");
     }
 
     double temperature = 0, humidity = 0, distance = 0;
@@ -838,11 +671,6 @@ static void handle_post_sensor_data(int fd, const http_request_t *req) {
     int has_hum  = json_get_double(req->body, "humidity", &humidity);
     int has_dist = json_get_double(req->body, "distance_cm", &distance);
 
-    /* Some ESP32 firmware revisions compute their own proximity flag
-     * client-side; we don't strictly need it since the hub re-evaluates the
-     * 30cm threshold itself below, but we log a mismatch if the node
-     * disagrees with us — useful for catching clock/threshold drift during
-     * debug. */
     int node_reported_proximity = 0;
     if (json_get_bool(req->body, "proximity_alert", &node_reported_proximity)) {
         if (has_dist && node_reported_proximity != (distance < PROXIMITY_THRESHOLD_CM)) {
@@ -887,9 +715,8 @@ static void handle_post_sensor_data(int fd, const http_request_t *req) {
               node_id, snapshot.temperature_c, snapshot.humidity_pct, snapshot.distance_cm);
 
     check_thresholds_and_alert(&snapshot);
-    influx_write_sensor_reading(&snapshot);
+    db_write_sensor_reading(&snapshot);
 
-    /* reflect proximity_alert flag possibly set inside check_thresholds */
     pthread_mutex_lock(&g_nodes_lock);
     n = find_or_create_node_locked(node_id);
     if (n) n->proximity_alert = snapshot.proximity_alert;
@@ -898,84 +725,161 @@ static void handle_post_sensor_data(int fd, const http_request_t *req) {
     http_send_json(fd, 200, "OK", "{\"status\":\"ok\"}");
 }
 
-/* -------------------------------------------------------------------------
- * Route: GET /nodes
- * ---------------------------------------------------------------------- */
+typedef struct {
+    char   node_id[32];
+    char   location[48];
+    int    has_temp;
+    double temperature;
+    double humidity;
+    int    has_dist;
+    double distance;
+    int    proximity_alert;
+    time_t last_seen;
+} node_row_t;
+
+#define MAX_NODE_ROWS 32
+
+/* GET /nodes: latest reading per node, read from SQLite via correlated subqueries. */
 static void handle_get_nodes(int fd) {
+    static const char *sql =
+        "SELECT s1.node_id,"
+        "       s1.location,"
+        "       (SELECT temperature FROM sensor_data s2 WHERE s2.node_id = s1.node_id"
+        "          AND s2.temperature IS NOT NULL ORDER BY s2.timestamp DESC LIMIT 1),"
+        "       (SELECT humidity FROM sensor_data s2 WHERE s2.node_id = s1.node_id"
+        "          AND s2.humidity IS NOT NULL ORDER BY s2.timestamp DESC LIMIT 1),"
+        "       (SELECT distance_cm FROM sensor_data s2 WHERE s2.node_id = s1.node_id"
+        "          AND s2.distance_cm IS NOT NULL ORDER BY s2.timestamp DESC LIMIT 1),"
+        "       (SELECT proximity_alert FROM sensor_data s2 WHERE s2.node_id = s1.node_id"
+        "          AND s2.distance_cm IS NOT NULL ORDER BY s2.timestamp DESC LIMIT 1),"
+        "       MAX(s1.timestamp)"
+        "  FROM sensor_data s1"
+        " GROUP BY s1.node_id;";
+
+    node_row_t rows[MAX_NODE_ROWS];
+    int row_count = 0;
+
+    pthread_mutex_lock(&g_db_lock);
+    sqlite3_stmt *stmt = NULL;
+    int rc = g_db ? sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) : SQLITE_ERROR;
+    if (rc != SQLITE_OK) {
+        LOG_ERR("handle_get_nodes: prepare failed: %s", g_db ? sqlite3_errmsg(g_db) : "db not open");
+        pthread_mutex_unlock(&g_db_lock);
+        http_send_json(fd, 200, "OK", "[]");
+        return;
+    }
+
+    while (row_count < MAX_NODE_ROWS && sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *node_id = sqlite3_column_text(stmt, 0);
+        if (!node_id) continue;
+        const unsigned char *location_db = sqlite3_column_text(stmt, 1);
+
+        node_row_t *r = &rows[row_count++];
+        memset(r, 0, sizeof(*r));
+        snprintf(r->node_id, sizeof(r->node_id), "%s", (const char *)node_id);
+        snprintf(r->location, sizeof(r->location), "%s", location_db ? (const char *)location_db : "");
+        r->has_temp = sqlite3_column_type(stmt, 2) != SQLITE_NULL;
+        r->temperature = sqlite3_column_double(stmt, 2);
+        r->humidity = sqlite3_column_double(stmt, 3);
+        r->has_dist = sqlite3_column_type(stmt, 4) != SQLITE_NULL;
+        r->distance = sqlite3_column_double(stmt, 4);
+        r->proximity_alert = sqlite3_column_int(stmt, 5);
+        r->last_seen = (time_t)sqlite3_column_int64(stmt, 6);
+    }
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_lock);
+
     char json[4096];
     size_t off = 0;
     off += (size_t)snprintf(json + off, sizeof(json) - off, "[");
 
-    pthread_mutex_lock(&g_nodes_lock);
     time_t now = time(NULL);
-    int first = 1;
-    for (int i = 0; i < MAX_NODES; i++) {
-        if (!g_nodes[i].in_use) continue;
-        node_state_t *n = &g_nodes[i];
-        int online = (now - n->last_seen) < NODE_OFFLINE_SEC;
+    for (int i = 0; i < row_count; i++) {
+        node_row_t *r = &rows[i];
 
-        if (!online && n->last_seen != 0) {
-            /* Fire (deduped/cooled-down) offline alert lazily on read. */
-            pthread_mutex_unlock(&g_nodes_lock);
-            push_alert(n->node_id, "node_offline", NULL,
+        char seed_location[48]; double lat, lon;
+        seed_known_location(r->node_id, seed_location, sizeof(seed_location), &lat, &lon);
+        const char *loc_display = r->location[0] ? r->location : seed_location;
+
+        int online = (now - r->last_seen) < NODE_OFFLINE_SEC;
+        if (!online) {
+            push_alert(r->node_id, "node_offline", NULL,
                        "Node %s offline — no data for over %ds, store-and-forward assumed active",
-                       n->node_id, NODE_OFFLINE_SEC);
-            pthread_mutex_lock(&g_nodes_lock);
+                       r->node_id, NODE_OFFLINE_SEC);
         }
 
-        if (!first) off += (size_t)snprintf(json + off, sizeof(json) - off, ",");
-        first = 0;
+        if (i > 0) off += (size_t)snprintf(json + off, sizeof(json) - off, ",");
         off += (size_t)snprintf(json + off, sizeof(json) - off,
             "{\"node_id\":\"%s\",\"location\":\"%s\",\"lat\":%.4f,\"lon\":%.4f,"
             "\"temperature_c\":%.1f,\"humidity_pct\":%.1f,\"distance_cm\":%.1f,"
             "\"proximity_alert\":%s,\"online\":%s,\"last_seen\":%ld}",
-            n->node_id, n->location, n->lat, n->lon,
-            n->temperature_c, n->humidity_pct, n->distance_cm,
-            n->proximity_alert ? "true" : "false",
+            r->node_id, loc_display, lat, lon,
+            r->has_temp ? r->temperature : 0.0,
+            r->has_temp ? r->humidity : 0.0,
+            r->has_dist ? r->distance : 0.0,
+            (r->has_dist && r->proximity_alert) ? "true" : "false",
             online ? "true" : "false",
-            (long)n->last_seen);
+            (long)r->last_seen);
 
-        if (off > sizeof(json) - 256) break; /* leave room, avoid overflow on many nodes */
+        if (off > sizeof(json) - 256) break;
     }
-    pthread_mutex_unlock(&g_nodes_lock);
 
     off += (size_t)snprintf(json + off, sizeof(json) - off, "]");
     http_send_json(fd, 200, "OK", json);
 }
 
-/* -------------------------------------------------------------------------
- * Route: GET /alerts  — most recent first, capped to avoid huge payloads.
- * ---------------------------------------------------------------------- */
-#define ALERTS_RESPONSE_LIMIT 50
-
+/* GET /alerts: last N alerts, most recent first, read from SQLite. */
 static void handle_get_alerts(int fd) {
+    static const char *sql =
+        "SELECT id, node_id, type, message, classification, timestamp "
+        "FROM alerts ORDER BY id DESC LIMIT ?;";
+
     char json[8192];
     size_t off = 0;
     off += (size_t)snprintf(json + off, sizeof(json) - off, "[");
 
-    pthread_mutex_lock(&g_alerts_lock);
-    int count = g_alert_count;
-    int returned = 0;
-    for (int k = 0; k < count && returned < ALERTS_RESPONSE_LIMIT; k++) {
-        int idx = (g_alert_head - 1 - k + MAX_ALERTS) % MAX_ALERTS;
-        alert_t *a = &g_alerts[idx];
-        if (returned > 0) off += (size_t)snprintf(json + off, sizeof(json) - off, ",");
+    pthread_mutex_lock(&g_db_lock);
+    sqlite3_stmt *stmt = NULL;
+    int rc = g_db ? sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) : SQLITE_ERROR;
+    if (rc != SQLITE_OK) {
+        LOG_ERR("handle_get_alerts: prepare failed: %s", g_db ? sqlite3_errmsg(g_db) : "db not open");
+        pthread_mutex_unlock(&g_db_lock);
+        http_send_json(fd, 200, "OK", "[]");
+        return;
+    }
+    sqlite3_bind_int(stmt, 1, ALERTS_RESPONSE_LIMIT);
+
+    int first = 1;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        sqlite3_int64 id = sqlite3_column_int64(stmt, 0);
+        const unsigned char *node_id = sqlite3_column_text(stmt, 1);
+        const unsigned char *type = sqlite3_column_text(stmt, 2);
+        const unsigned char *message = sqlite3_column_text(stmt, 3);
+        const unsigned char *classification = sqlite3_column_text(stmt, 4);
+        sqlite3_int64 ts = sqlite3_column_int64(stmt, 5);
+
+        if (!first) off += (size_t)snprintf(json + off, sizeof(json) - off, ",");
+        first = 0;
         off += (size_t)snprintf(json + off, sizeof(json) - off,
-            "{\"id\":%ld,\"node_id\":\"%s\",\"type\":\"%s\",\"message\":\"%s\","
-            "\"classification\":\"%s\",\"timestamp\":%ld}",
-            a->id, a->node_id, a->type, a->message, a->classification, (long)a->timestamp);
-        returned++;
+            "{\"id\":%lld,\"node_id\":\"%s\",\"type\":\"%s\",\"message\":\"%s\","
+            "\"classification\":\"%s\",\"timestamp\":%lld}",
+            (long long)id,
+            node_id ? (const char *)node_id : "",
+            type ? (const char *)type : "",
+            message ? (const char *)message : "",
+            classification ? (const char *)classification : "",
+            (long long)ts);
+
         if (off > sizeof(json) - 512) break;
     }
-    pthread_mutex_unlock(&g_alerts_lock);
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_lock);
 
     off += (size_t)snprintf(json + off, sizeof(json) - off, "]");
     http_send_json(fd, 200, "OK", json);
 }
 
-/* -------------------------------------------------------------------------
- * Connection dispatcher (runs in its own thread per connection).
- * ---------------------------------------------------------------------- */
+/* Per-connection request dispatcher, run in its own thread. */
 static void *handle_client_thread(void *arg) {
     int fd = (int)(intptr_t)arg;
 
@@ -1005,6 +909,7 @@ static void *handle_client_thread(void *arg) {
 
 static int g_listen_fd = -1;
 
+/* Binds :g_http_port and accepts connections until g_shutdown. */
 static void run_http_server(void) {
     g_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (g_listen_fd < 0) {
@@ -1054,10 +959,7 @@ static void run_http_server(void) {
     }
 }
 
-/* =========================================================================
- * BACKGROUND: HC-SR04 POLLING THREAD
- * ========================================================================= */
-
+/* Polls HC-SR04 every GPIO_POLL_INTERVAL_MS, checks thresholds, persists readings. */
 static void *gpio_poll_thread(void *arg) {
     (void)arg;
     LOG_INFO("HC-SR04 polling thread started (interval=%dms, sim=%s)",
@@ -1079,7 +981,7 @@ static void *gpio_poll_thread(void *arg) {
 
             if (n) {
                 check_thresholds_and_alert(&snapshot);
-                influx_write_sensor_reading(&snapshot);
+                db_write_sensor_reading(&snapshot);
 
                 pthread_mutex_lock(&g_nodes_lock);
                 node_state_t *n2 = find_or_create_node_locked("node_1");
@@ -1093,47 +995,34 @@ static void *gpio_poll_thread(void *arg) {
     return NULL;
 }
 
-/* =========================================================================
- * SIGNAL HANDLING / SHUTDOWN
- * ========================================================================= */
-
+/* SIGINT/SIGTERM handler: signals shutdown and unblocks accept(). */
 static void handle_sigint(int sig) {
     (void)sig;
     g_shutdown = 1;
     if (g_listen_fd >= 0) close(g_listen_fd);
 }
 
-/* =========================================================================
- * CONFIG LOADING
- * ========================================================================= */
-
+/* Loads config from env vars and initializes GPIO. */
 static void load_config(void) {
     const char *v;
 
     v = getenv("SENTINEL_HTTP_PORT");
     g_http_port = v ? atoi(v) : DEFAULT_HTTP_PORT;
 
-    v = getenv("INFLUX_HOST");
-    snprintf(g_influx_host, sizeof(g_influx_host), "%s", v ? v : DEFAULT_INFLUX_HOST);
-
-    v = getenv("INFLUX_PORT");
-    g_influx_port = v ? atoi(v) : DEFAULT_INFLUX_PORT;
-
-    v = getenv("INFLUX_ORG");
-    snprintf(g_influx_org, sizeof(g_influx_org), "%s", v ? v : DEFAULT_INFLUX_ORG);
-
-    v = getenv("INFLUX_BUCKET");
-    snprintf(g_influx_bucket, sizeof(g_influx_bucket), "%s", v ? v : DEFAULT_INFLUX_BUCKET);
-
-    v = getenv("INFLUX_TOKEN");
-    snprintf(g_influx_token, sizeof(g_influx_token), "%s", v ? v : "");
+    v = getenv("SENTINEL_DB_PATH");
+    if (v) {
+        snprintf(g_db_path, sizeof(g_db_path), "%s", v);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) home = ".";
+        snprintf(g_db_path, sizeof(g_db_path), "%s%s", home, DEFAULT_DB_SUBPATH);
+    }
 
     v = getenv("SENTINEL_OPENCV_CMD");
     snprintf(g_opencv_cmd, sizeof(g_opencv_cmd), "%s", v ? v : DEFAULT_OPENCV_CMD);
 
     v = getenv("SENTINEL_GPIO_SIM");
-    g_gpio_sim = v ? atoi(v) : 0; /* real HC-SR04 GPIO by default; set
-                                     SENTINEL_GPIO_SIM=1 to force simulation */
+    g_gpio_sim = v ? atoi(v) : 0;
 
     if (!g_gpio_sim) {
         if (gpio_hw_init() != 0) {
@@ -1142,16 +1031,7 @@ static void load_config(void) {
             g_gpio_sim = 1;
         }
     }
-
-    if (g_influx_token[0] == '\0') {
-        LOG_WARN("INFLUX_TOKEN is not set. InfluxDB writes will be skipped "
-                  "(logged only) until you export INFLUX_TOKEN=<your token>.");
-    }
 }
-
-/* =========================================================================
- * MAIN
- * ========================================================================= */
 
 int main(void) {
     load_config();
@@ -1160,9 +1040,13 @@ int main(void) {
     signal(SIGTERM, handle_sigint);
     signal(SIGPIPE, SIG_IGN);
 
-    LOG_INFO("Sentinel hub starting — HTTP :%d, InfluxDB %s:%d (bucket=%s), GPIO sim=%s",
-              g_http_port, g_influx_host, g_influx_port, g_influx_bucket,
-              g_gpio_sim ? "on" : "off");
+    if (db_init() != 0) {
+        LOG_ERR("Could not open/create SQLite database at %s — exiting.", g_db_path);
+        return 1;
+    }
+
+    LOG_INFO("Sentinel hub starting — HTTP :%d, DB %s, GPIO sim=%s",
+              g_http_port, g_db_path, g_gpio_sim ? "on" : "off");
 
     pthread_t gpio_tid;
     if (pthread_create(&gpio_tid, NULL, gpio_poll_thread, NULL) != 0) {
@@ -1171,9 +1055,10 @@ int main(void) {
     }
     pthread_detach(gpio_tid);
 
-    run_http_server(); /* blocks until g_shutdown */
+    run_http_server();
 
     gpio_hw_cleanup();
+    db_close();
     LOG_INFO("Shutting down.");
     return 0;
 }
