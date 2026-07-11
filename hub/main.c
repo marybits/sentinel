@@ -4,7 +4,8 @@
  * QNX 8.0 base station for the Sentinel Arctic sensor network (cuHacking).
  * Receives ESP32/DHT11 readings over HTTP, polls an HC-SR04 over GPIO,
  * triggers the camera + an OpenCV classifier on proximity alerts, persists
- * everything to SQLite, and serves GET /nodes and GET /alerts for Flask.
+ * everything to SQLite, and serves GET /nodes, GET /alerts, and GET /history
+ * for Flask.
  *
  * Build:  clang -Wall -Wextra -O2 -std=c11 -o hub main.c -lpthread -lsqlite3
  *         (see hub/Makefile)
@@ -56,6 +57,8 @@
 #define ALERT_COOLDOWN_SEC       15 /* min seconds between repeats of the same alert */
 #define CAMERA_TIMEOUT_SEC       5
 #define ALERTS_RESPONSE_LIMIT    20
+#define HISTORY_RESPONSE_LIMIT_DEFAULT 100
+#define HISTORY_RESPONSE_LIMIT_MAX     200
 
 static int   g_http_port      = DEFAULT_HTTP_PORT;
 static char  g_db_path[512];
@@ -251,6 +254,39 @@ static int json_get_string(const char *json, const char *key, char *out, size_t 
     }
     out[i] = '\0';
     return 1;
+}
+
+/* Reads a value from a request path's query string, e.g. "key" out of
+ * "/history?node_id=node_1&limit=40". Returns 0 if the key isn't present. */
+static int query_get_string(const char *path, const char *key, char *out, size_t out_sz) {
+    const char *q = strchr(path, '?');
+    if (!q) return 0;
+    q++;
+
+    size_t klen = strlen(key);
+    while (*q) {
+        const char *eq = strchr(q, '=');
+        if (!eq) break;
+        const char *amp = strchr(eq, '&');
+        size_t vlen = amp ? (size_t)(amp - eq - 1) : strlen(eq + 1);
+
+        if ((size_t)(eq - q) == klen && strncmp(q, key, klen) == 0) {
+            size_t copy = vlen < out_sz - 1 ? vlen : out_sz - 1;
+            memcpy(out, eq + 1, copy);
+            out[copy] = '\0';
+            return 1;
+        }
+        if (!amp) break;
+        q = amp + 1;
+    }
+    return 0;
+}
+
+/* Same as query_get_string, but parsed as an int with a default/clamp. */
+static int query_get_int(const char *path, const char *key, int default_val) {
+    char buf[16];
+    if (!query_get_string(path, key, buf, sizeof(buf))) return default_val;
+    return atoi(buf);
 }
 
 /* Opens/creates the SQLite DB, schema, and WAL mode. */
@@ -879,6 +915,92 @@ static void handle_get_alerts(int fd) {
     http_send_json(fd, 200, "OK", json);
 }
 
+typedef struct {
+    char   node_id[32];
+    char   location[48];
+    int    has_temp;
+    double temperature;
+    double humidity;
+    int    has_dist;
+    double distance;
+    int    proximity_alert;
+    time_t timestamp;
+} history_row_t;
+
+#define MAX_HISTORY_ROWS HISTORY_RESPONSE_LIMIT_MAX
+
+/* GET /history?node_id=X&limit=N: recent sensor_data rows for one node,
+ * oldest first (mirrors Flask's own GET /history for nodes 2-5). */
+static void handle_get_history(int fd, const http_request_t *req) {
+    char node_id[32];
+    if (!query_get_string(req->path, "node_id", node_id, sizeof(node_id))) {
+        http_send_json(fd, 400, "Bad Request", "{\"error\":\"node_id required\"}");
+        return;
+    }
+    int limit = query_get_int(req->path, "limit", HISTORY_RESPONSE_LIMIT_DEFAULT);
+    if (limit < 1) limit = 1;
+    if (limit > HISTORY_RESPONSE_LIMIT_MAX) limit = HISTORY_RESPONSE_LIMIT_MAX;
+
+    static const char *sql =
+        "SELECT node_id, location, temperature, humidity, distance_cm, proximity_alert, timestamp "
+        "FROM sensor_data WHERE node_id = ? ORDER BY timestamp DESC LIMIT ?;";
+
+    history_row_t rows[MAX_HISTORY_ROWS];
+    int row_count = 0;
+
+    pthread_mutex_lock(&g_db_lock);
+    sqlite3_stmt *stmt = NULL;
+    int rc = g_db ? sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) : SQLITE_ERROR;
+    if (rc != SQLITE_OK) {
+        LOG_ERR("handle_get_history: prepare failed: %s", g_db ? sqlite3_errmsg(g_db) : "db not open");
+        pthread_mutex_unlock(&g_db_lock);
+        http_send_json(fd, 200, "OK", "[]");
+        return;
+    }
+    sqlite3_bind_text(stmt, 1, node_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, limit);
+
+    while (row_count < MAX_HISTORY_ROWS && sqlite3_step(stmt) == SQLITE_ROW) {
+        history_row_t *r = &rows[row_count++];
+        memset(r, 0, sizeof(*r));
+        const unsigned char *nid = sqlite3_column_text(stmt, 0);
+        const unsigned char *loc = sqlite3_column_text(stmt, 1);
+        snprintf(r->node_id, sizeof(r->node_id), "%s", nid ? (const char *)nid : "");
+        snprintf(r->location, sizeof(r->location), "%s", loc ? (const char *)loc : "");
+        r->has_temp = sqlite3_column_type(stmt, 2) != SQLITE_NULL;
+        r->temperature = sqlite3_column_double(stmt, 2);
+        r->humidity = sqlite3_column_double(stmt, 3);
+        r->has_dist = sqlite3_column_type(stmt, 4) != SQLITE_NULL;
+        r->distance = sqlite3_column_double(stmt, 4);
+        r->proximity_alert = sqlite3_column_int(stmt, 5);
+        r->timestamp = (time_t)sqlite3_column_int64(stmt, 6);
+    }
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_lock);
+
+    /* Rows came back newest-first (DESC); emit oldest-first for the chart. */
+    char json[8192];
+    size_t off = 0;
+    off += (size_t)snprintf(json + off, sizeof(json) - off, "[");
+    for (int i = row_count - 1; i >= 0; i--) {
+        history_row_t *r = &rows[i];
+        if (i != row_count - 1) off += (size_t)snprintf(json + off, sizeof(json) - off, ",");
+        off += (size_t)snprintf(json + off, sizeof(json) - off,
+            "{\"node_id\":\"%s\",\"location\":\"%s\","
+            "\"temperature\":%.1f,\"humidity\":%.1f,\"distance_cm\":%.1f,"
+            "\"proximity_alert\":%s,\"timestamp\":%ld}",
+            r->node_id, r->location,
+            r->has_temp ? r->temperature : 0.0,
+            r->has_temp ? r->humidity : 0.0,
+            r->has_dist ? r->distance : 0.0,
+            (r->has_dist && r->proximity_alert) ? "true" : "false",
+            (long)r->timestamp);
+        if (off > sizeof(json) - 256) break;
+    }
+    off += (size_t)snprintf(json + off, sizeof(json) - off, "]");
+    http_send_json(fd, 200, "OK", json);
+}
+
 /* Per-connection request dispatcher, run in its own thread. */
 static void *handle_client_thread(void *arg) {
     int fd = (int)(intptr_t)arg;
@@ -897,6 +1019,9 @@ static void *handle_client_thread(void *arg) {
         handle_get_nodes(fd);
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/alerts") == 0) {
         handle_get_alerts(fd);
+    } else if (strcmp(req.method, "GET") == 0 && strncmp(req.path, "/history", 8) == 0 &&
+               (req.path[8] == '\0' || req.path[8] == '?')) {
+        handle_get_history(fd, &req);
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/health") == 0) {
         http_send_json(fd, 200, "OK", "{\"status\":\"sentinel-hub-up\"}");
     } else {
@@ -936,7 +1061,7 @@ static void run_http_server(void) {
     }
 
     LOG_INFO("Sentinel hub HTTP server listening on :%d "
-              "(POST /sensor-data, GET /nodes, GET /alerts, GET /health)", g_http_port);
+              "(POST /sensor-data, GET /nodes, GET /alerts, GET /history, GET /health)", g_http_port);
 
     while (!g_shutdown) {
         struct sockaddr_in client_addr;

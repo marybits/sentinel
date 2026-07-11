@@ -1,11 +1,15 @@
 // Shared node status classification — single source of truth so status
 // cards, alerts, and map markers can't drift out of sync.
-const TEMP_WARNING_LOW_C = -35;
-const TEMP_WARNING_HIGH_C = 15;
-const TEMP_CRITICAL_LOW_C = -45;
-const TEMP_CRITICAL_HIGH_C = 25;
-const HUMIDITY_HIGH_PCT = 80;
-const BATTERY_LOW_PCT = 20;
+// Mirrors backend/app.py's classify_status() thresholds exactly, so the
+// card badge always agrees with whatever triggered the alert in the feed.
+// Backend has no separate "warning" tier for high temp (jumps straight to
+// critical at TEMP_ALERT_C), so warning/critical high are set equal here.
+const TEMP_WARNING_LOW_C = -20;   // matches TEMP_LOW_WARN_C
+const TEMP_WARNING_HIGH_C = 20;   // matches TEMP_ALERT_C
+const TEMP_CRITICAL_LOW_C = -40;  // matches TEMP_LOW_CRITICAL_C
+const TEMP_CRITICAL_HIGH_C = 20;  // matches TEMP_ALERT_C
+const HUMIDITY_HIGH_PCT = 80;     // frontend-only nicety — backend doesn't alert on this
+const BATTERY_LOW_PCT = 20;       // matches BATTERY_LOW_PCT
 
 function getTemperatureSeverity(tempC) {
   if (tempC < TEMP_CRITICAL_LOW_C || tempC > TEMP_CRITICAL_HIGH_C) return "critical";

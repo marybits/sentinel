@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   LineChart,
   Line,
@@ -10,6 +10,88 @@ import {
   ReferenceLine,
 } from "recharts";
 import { mockEnvironmentalData, mockBatteryData } from "../data/mockTelemetryData";
+import { FLASK_BASE_URL } from "../config";
+
+// Both tabs are live now. Power Systems polls node_4 (simulated, readings
+// land in Flask's SQLite `readings` table via POST /data). Environmental
+// polls node_1 — its temp/humidity/distance history lives in the Pi's own
+// sensor_data table, so Flask's GET /history proxies node_1 requests to the
+// Pi's GET /history route instead of querying the local table.
+const HISTORY_POLL_MS = 5000;
+const HISTORY_LIMIT = 40;
+
+function formatTimeLabel(unixSeconds) {
+  const d = new Date(unixSeconds * 1000);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+// Generic "poll GET /history?node_id=X, map rows, keep last-known-good on
+// failure" hook shared by both charts.
+function useHistoryPoll(nodeId, mapRow, initialData) {
+  const [data, setData] = useState(initialData);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timeoutId;
+
+    async function poll() {
+      try {
+        const res = await fetch(
+          `${FLASK_BASE_URL}/history?node_id=${nodeId}&limit=${HISTORY_LIMIT}`
+        );
+        if (!res.ok) throw new Error(`Backend responded ${res.status}`);
+        const rows = await res.json();
+
+        if (!cancelled && rows.length > 0) {
+          setData(rows.map(mapRow).filter(Boolean));
+        }
+      } catch (err) {
+        // Backend down or unreachable — keep showing last-known-good data.
+        console.error(`History poll failed for ${nodeId}, keeping last known state:`, err);
+      } finally {
+        if (!cancelled) {
+          timeoutId = setTimeout(poll, HISTORY_POLL_MS);
+        }
+      }
+    }
+
+    poll();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeId]);
+
+  return data;
+}
+
+function useBatteryHistory() {
+  return useHistoryPoll(
+    "node_4",
+    (r) =>
+      r.battery !== null && r.battery !== undefined
+        ? { time: formatTimeLabel(r.timestamp), battery_pct: r.battery }
+        : null,
+    mockBatteryData
+  );
+}
+
+function useEnvironmentalHistory() {
+  return useHistoryPoll(
+    "node_1",
+    (r) =>
+      r.temp !== null && r.temp !== undefined
+        ? {
+            time: formatTimeLabel(r.timestamp),
+            temperature: r.temp,
+            proximity: r.distance_cm,
+          }
+        : null,
+    mockEnvironmentalData
+  );
+}
 
 const AXIS_TICK_STYLE = {
   fill: "#94a3b8",
@@ -41,9 +123,11 @@ function LegendDot({ color, label }) {
 }
 
 function EnvironmentalChart() {
+  const data = useEnvironmentalHistory();
+
   return (
     <ResponsiveContainer width="100%" height={280}>
-      <LineChart data={mockEnvironmentalData}>
+      <LineChart data={data}>
         <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" />
         <XAxis dataKey="time" tick={AXIS_TICK_STYLE} axisLine={AXIS_LINE} tickLine={AXIS_LINE} />
         <YAxis
@@ -71,12 +155,13 @@ function EnvironmentalChart() {
 }
 
 function PowerChart() {
-  const latest = mockBatteryData[mockBatteryData.length - 1].battery_pct;
+  const data = useBatteryHistory();
+  const latest = data.length > 0 ? data[data.length - 1].battery_pct : 0;
   const lineColor = latest < 20 ? "#f43f5e" : "#10b981";
 
   return (
     <ResponsiveContainer width="100%" height={280}>
-      <LineChart data={mockBatteryData}>
+      <LineChart data={data}>
         <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" />
         <XAxis dataKey="time" tick={AXIS_TICK_STYLE} axisLine={AXIS_LINE} tickLine={AXIS_LINE} />
         <YAxis
@@ -124,7 +209,7 @@ export default function TelemetryPanel() {
         <>
           <div className="flex items-center justify-between mb-2">
             <p className="font-mono text-[10px] text-slate-500 uppercase tracking-wider">
-              NODE_1 · INUVIK
+              NODE_1 · INUVIK (live)
             </p>
             <div className="flex items-center gap-4">
               <LegendDot color="#10b981" label="Temperature" />
@@ -136,7 +221,7 @@ export default function TelemetryPanel() {
       ) : (
         <>
           <p className="font-mono text-[10px] text-slate-500 uppercase tracking-wider mb-2">
-            NODE_4 · RESOLUTE — Battery Degradation
+            NODE_4 · RESOLUTE — Battery Degradation (live)
           </p>
           <PowerChart />
         </>

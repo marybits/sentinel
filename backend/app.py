@@ -175,6 +175,23 @@ def fetch_pi_alerts():
     except (requests.exceptions.RequestException, ValueError) as e:
         print(f"[pi] /alerts fetch failed: {e}")
         return []
+
+def fetch_pi_history(node_id, limit):
+    '''Fetch time-series readings for a node from the Pi's own sensor_data
+    table (currently just node_1 — its temp/humidity/proximity history never
+    passes through Flask's /data, so it isn't in our local SQLite). Returns
+    [] if unreachable.'''
+    try:
+        resp = requests.get(
+            f"{PI_URL}/history",
+            params={"node_id": node_id, "limit": limit},
+            timeout=PI_TIMEOUT_SEC,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        print(f"[pi] /history fetch failed: {e}")
+        return []
 # ----------------------------------------------------------------
 # Routes
 # ----------------------------------------------------------------
@@ -304,9 +321,33 @@ def get_alerts():
 
 @app.route("/history", methods=["GET"])
 def get_history():
-    """Time-series readings for graphs. ?node_id=node_2&limit=100"""
+    """Time-series readings for graphs. ?node_id=node_2&limit=100
+
+    node_1 (the Pi) keeps its own sensor_data history — its readings never
+    pass through POST /data, so our local SQLite has nothing for it. Proxy
+    those requests to the Pi's GET /history instead of querying locally.
+    """
     node_id = request.args.get("node_id")
     limit = int(request.args.get("limit", 100))
+
+    if node_id == "node_1":
+        pi_rows = fetch_pi_history(node_id, limit)
+        result = [
+            {
+                "node_id": r.get("node_id"),
+                "location": r.get("location"),
+                "lat": None,
+                "lon": None,
+                "temp": r.get("temperature"),
+                "humidity": r.get("humidity"),
+                "battery": None,
+                "distance_cm": r.get("distance_cm"),
+                "proximity_alert": r.get("proximity_alert"),
+                "timestamp": r.get("timestamp"),
+            }
+            for r in pi_rows  # Pi already returns oldest first
+        ]
+        return jsonify(result)
 
     if node_id:
         rows = sqlite_conn.execute(
@@ -330,6 +371,8 @@ def get_history():
             "temp": r[4],
             "humidity": r[5],
             "battery": r[6],
+            "distance_cm": None,
+            "proximity_alert": None,
             "timestamp": r[7],
         }
         for r in reversed(rows) # oldest first

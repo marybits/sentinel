@@ -1,9 +1,6 @@
-const ALERT_TYPE_META = {
-  proximity_alert: { label: "PROXIMITY", dot: "bg-rose-500",  text: "text-rose-500" },
-  node_offline:    { label: "OFFLINE",   dot: "bg-rose-500",  text: "text-rose-500" },
-  temp_high:       { label: "TEMP HIGH", dot: "bg-amber-500", text: "text-amber-500" },
-  temp_low:        { label: "TEMP LOW",  dot: "bg-amber-500", text: "text-amber-500" },
-  humidity_high:   { label: "HUMIDITY",  dot: "bg-amber-500", text: "text-amber-500" },
+const SEVERITY_META = {
+  critical: { dot: "bg-rose-500", text: "text-rose-500" },
+  warning: { dot: "bg-amber-500", text: "text-amber-500" },
 };
 
 function formatRelativeTime(unixSeconds) {
@@ -14,12 +11,12 @@ function formatRelativeTime(unixSeconds) {
   return `${Math.floor(deltaMin / 60)}h ago`;
 }
 
+function humanizeType(type) {
+  return type.replace(/_/g, " ").toUpperCase();
+}
+
 function AlertRow({ alert }) {
-  const meta = ALERT_TYPE_META[alert.type] ?? {
-    label: alert.type.toUpperCase(),
-    dot: "bg-slate-500",
-    text: "text-slate-400",
-  };
+  const meta = SEVERITY_META[alert.severity] ?? SEVERITY_META.warning;
 
   return (
     <div className="flex items-start gap-3 border-b border-slate-800 px-3 py-2 last:border-b-0">
@@ -27,7 +24,7 @@ function AlertRow({ alert }) {
       <div className="flex-1 min-w-0">
         <div className="flex items-center justify-between gap-2">
           <span className={`font-mono text-[10px] uppercase tracking-wider ${meta.text}`}>
-            {meta.label}
+            {humanizeType(alert.type)}
           </span>
           <span className="font-mono text-[10px] text-slate-500 shrink-0">
             {formatRelativeTime(alert.timestamp)}
