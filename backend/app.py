@@ -31,9 +31,12 @@ MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://<user>:<password>@cluster
 
 SQLITE_PATH = os.environ.get("SQLITE_PATH", "sentinel.db")  # lives next to app.py
 
-OFFLINE_THRESHOLD_SEC = 8   # no data for this long -> node marked offline
+
+OFFLINE_THRESHOLD_SEC = 15  # no data for this long -> node marked offline
 PROXIMITY_ALERT_CM = 30     # distance below this -> proximity alert
-TEMP_ALERT_C = 35           # temp above this -> temperature alert
+TEMP_ALERT_C = 20           # temp above this -> high-temp alert (overheating/fire risk)
+TEMP_LOW_WARN_C = -20       # temp below this -> cold warning (battery drain, equipment stress)
+TEMP_LOW_CRITICAL_C = -40   # temp below this -> critical cold alert (frostbite/hypothermia/equipment failure)
 BATTERY_LOW_PCT = 20        # battery below this -> low battery alert
 
 # ----------------------------------------------------------------
@@ -72,14 +75,13 @@ nodes_state = {}
 
 
 def classify_status(node_id, data, last_seen_age):
-    """Return 'red' | 'yellow' | 'green' for a node's current reading."""
-    if last_seen_age > OFFLINE_THRESHOLD_SEC:
-        return "red"
-    if data.get("distance") is not None and data["distance"] < PROXIMITY_ALERT_CM:
-        return "red"
     if data.get("temp") is not None and data["temp"] > TEMP_ALERT_C:
         return "red"
+    if data.get("temp") is not None and data["temp"] < TEMP_LOW_CRITICAL_C:
+        return "red"
     if data.get("battery") is not None and data["battery"] < BATTERY_LOW_PCT:
+        return "yellow"
+    if data.get("temp") is not None and data["temp"] < TEMP_LOW_WARN_C:
         return "yellow"
     return "green"
 
@@ -207,10 +209,14 @@ def _ingest_reading(node_id, data, now):
             write_alert(node_id, "proximity", f"{node_id}: object within {data['distance']}cm", "critical")
         elif data.get("temp") is not None and data["temp"] > TEMP_ALERT_C:
             write_alert(node_id, "temperature", f"{node_id}: temperature at {data['temp']}°C", "critical")
+        elif data.get("temp") is not None and data["temp"] < TEMP_LOW_CRITICAL_C:
+            write_alert(node_id, "temperature_cold", f"{node_id}: extreme cold at {data['temp']}°C — frostbite/equipment failure risk", "critical")
     if status == "yellow" and prev_status != "yellow":
         if data.get("battery") is not None and data["battery"] < BATTERY_LOW_PCT:
             write_alert(node_id, "battery", f"{node_id}: battery low at {data['battery']}%", "warning")
-
+        elif data.get("temp") is not None and data["temp"] < TEMP_LOW_WARN_C:
+            write_alert(node_id, "temperature_cold", f"{node_id}: cold approaching danger threshold at {data['temp']}°C", "warning")
+            
     if not was_known:
         write_event(node_id, "connected", f"{node_id} came online")
 

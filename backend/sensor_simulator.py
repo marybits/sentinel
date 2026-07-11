@@ -41,8 +41,9 @@ def maybe_trigger_anomaly(s):
     if random.random() < 0.03:
         s["distance"] = round(random.uniform(5, 25), 1)  # proximity alert
     if random.random() < 0.02:
-        s["temp"] = round(random.uniform(36, 42), 1)  # temp alert
-
+        s["temp"] = round(random.uniform(36, 42), 1)  # high-temp alert
+    if random.random() < 0.02:
+        s["temp"] = round(random.uniform(-30, -22), 1)  # cold-snap alert (critical)
 
 def maybe_toggle_offline(node_id, s):
     if not s["offline"] and random.random() < 0.01:
@@ -59,7 +60,7 @@ def maybe_toggle_offline(node_id, s):
 
 
 def build_reading(s):
-    s["temp"] = drift(s["temp"], 0.5, 15, 42)
+    s["temp"] = drift(s["temp"], 0.5, -40, 42)
     s["humidity"] = drift(s["humidity"], 1, 20, 80)
     s["distance"] = drift(s["distance"], 15, 5, 400)
     s["battery"] = max(0, s["battery"] - random.uniform(0.02, 0.08))  # steady drain
