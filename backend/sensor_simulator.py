@@ -1,7 +1,7 @@
 '''Simulates 4 fake sensor nodes (node_2 - node_5) sending readings to the
 Flask backend every 2s. Includes:
   - gradual battery drain
-  - occasional random anomalies (proximity, temperature spike)
+  - occasional random anomalies (temperature spike)
   - occasional random "offline" periods, with store-and-forward:
     readings queue up locally while offline, then flush as a batch
     on reconnect (this is what your dashboard's sync animation reacts to)
@@ -22,7 +22,6 @@ state = {
     node_id: {
         "temp": round(random.uniform(18, 24), 1),
         "humidity": round(random.uniform(30, 60), 1),
-        "distance": round(random.uniform(100, 400), 1),
         "battery": round(random.uniform(70, 100), 1),
         "offline": False,
         "buffer": [],  # readings queued while offline
@@ -38,8 +37,6 @@ def drift(value, amount, lo, hi):
 
 def maybe_trigger_anomaly(s):
     #potential trigger for anomalies.
-    if random.random() < 0.03:
-        s["distance"] = round(random.uniform(5, 25), 1)  # proximity alert
     if random.random() < 0.02:
         s["temp"] = round(random.uniform(36, 42), 1)  # high-temp alert
     if random.random() < 0.02:
@@ -62,13 +59,11 @@ def maybe_toggle_offline(node_id, s):
 def build_reading(s):
     s["temp"] = drift(s["temp"], 0.5, -40, 42)
     s["humidity"] = drift(s["humidity"], 1, 20, 80)
-    s["distance"] = drift(s["distance"], 15, 5, 400)
     s["battery"] = max(0, s["battery"] - random.uniform(0.02, 0.08))  # steady drain
     maybe_trigger_anomaly(s)
     return {
         "temp": round(s["temp"], 1),
         "humidity": round(s["humidity"], 1),
-        "distance": round(s["distance"], 1),
         "battery": round(s["battery"], 1),
     }
 

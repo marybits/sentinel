@@ -156,7 +156,7 @@ def fetch_pi_nodes():
         resp = requests.get(f"{PI_URL}/nodes", timeout=PI_TIMEOUT_SEC)
         resp.raise_for_status()
         return resp.json()
-    except requests.exceptions.RequestException as e:
+    except (requests.exceptions.RequestException, ValueError) as e:
         print(f"[pi] /nodes fetch failed: {e}")
         return []
 
@@ -166,7 +166,7 @@ def fetch_pi_alerts():
         resp = requests.get(f"{PI_URL}/alerts", timeout=PI_TIMEOUT_SEC)
         resp.raise_for_status()
         return resp.json()
-    except requests.exceptions.RequestException as e:
+    except (requests.exceptions.RequestException, ValueError) as e:
         print(f"[pi] /alerts fetch failed: {e}")
         return []
 # ----------------------------------------------------------------
