@@ -16,6 +16,8 @@
  *   SENTINEL_DB_PATH     SQLite DB path            (default $HOME/sentinel/sentinel.db)
  *   SENTINEL_GPIO_SIM    force simulated HC-SR04   (default 0, real GPIO)
  *   SENTINEL_OPENCV_CMD  camera classifier command (default ./opencv_classify.py)
+ *   SENTINEL_SNAPSHOT_CMD single-frame capture cmd (default ./capture_snapshot,
+ *                          see hub/capture_snapshot.c — run before the classifier)
  *
  * GPIO note: talks to HC-SR04 over /dev/gpio23 (TRIG) / /dev/gpio24 (ECHO)
  * using a best-effort read/write protocol (see gpio_pin_read/gpio_pin_write);
@@ -45,6 +47,7 @@
 
 #define DEFAULT_HTTP_PORT        8080
 #define DEFAULT_OPENCV_CMD       "./opencv_classify.py"
+#define DEFAULT_SNAPSHOT_CMD     "./capture_snapshot" /* see hub/capture_snapshot.c */
 #define DEFAULT_DB_SUBPATH       "/sentinel/sentinel.db" /* appended to $HOME */
 
 #define MAX_NODES                8
@@ -65,6 +68,7 @@
 static int   g_http_port      = DEFAULT_HTTP_PORT;
 static char  g_db_path[512];
 static char  g_opencv_cmd[256];
+static char  g_snapshot_cmd[256];
 static int   g_gpio_sim       = 1;
 
 static sqlite3          *g_db = NULL;
@@ -721,6 +725,18 @@ static char *run_classifier_with_timeout(const char *cmd, int timeout_sec) {
 static void trigger_camera_and_classify(const char *node_id, double distance_cm) {
     LOG_INFO("Perimeter breach on %s (%.1fcm) — triggering camera + OpenCV", node_id, distance_cm);
 
+    /* Grab one fresh frame first (hub/capture_snapshot.c — a separate,
+     * standalone binary; does not touch this process's threads/state) so
+     * the classifier below has something current to read instead of a
+     * stale or missing /tmp/latest_snapshot.raw. Best-effort: a snapshot
+     * failure doesn't cancel the alert, just logs a warning — the
+     * classifier can still fall back to "unknown" same as a timeout. */
+    int snap_rc = system(g_snapshot_cmd);
+    if (snap_rc != 0) {
+        LOG_WARN("capture_snapshot ('%s') exited with code %d — classifying without a fresh frame",
+                  g_snapshot_cmd, snap_rc);
+    }
+
     char *classification = run_classifier_with_timeout(g_opencv_cmd, CAMERA_TIMEOUT_SEC);
     const char *cls = classification ? classification : "unknown";
 
@@ -1289,6 +1305,9 @@ static void load_config(void) {
 
     v = getenv("SENTINEL_OPENCV_CMD");
     snprintf(g_opencv_cmd, sizeof(g_opencv_cmd), "%s", v ? v : DEFAULT_OPENCV_CMD);
+
+    v = getenv("SENTINEL_SNAPSHOT_CMD");
+    snprintf(g_snapshot_cmd, sizeof(g_snapshot_cmd), "%s", v ? v : DEFAULT_SNAPSHOT_CMD);
 
     v = getenv("SENTINEL_GPIO_SIM");
     g_gpio_sim = v ? atoi(v) : 0;
