@@ -15,6 +15,7 @@ import os
 import time
 import sqlite3
 from datetime import datetime, timezone
+import requests
 
 from dotenv import load_dotenv
 load_dotenv()  # reads .env in this folder and sets the env vars below
@@ -24,16 +25,19 @@ from flask_cors import CORS
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 
-# ----------------------------------------------------------------
-# Config (env vars, with hackathon-friendly fallbacks)
-# ----------------------------------------------------------------
+# raspberry pi
+PI_URL = os.environ.get("PI_URL", "http://172.20.10.9:8080")
+PI_TIMEOUT_SEC = 2  # keep short so a dead Pi doesn't hang the dashboard's request
+
+
+#env vars
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://<user>:<password>@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority")
 
 SQLITE_PATH = os.environ.get("SQLITE_PATH", "sentinel.db")  # lives next to app.py
 
 
+# alert thresholds
 OFFLINE_THRESHOLD_SEC = 15  # no data for this long -> node marked offline
-PROXIMITY_ALERT_CM = 30     # distance below this -> proximity alert
 TEMP_ALERT_C = 20           # temp above this -> high-temp alert (overheating/fire risk)
 TEMP_LOW_WARN_C = -20       # temp below this -> cold warning (battery drain, equipment stress)
 TEMP_LOW_CRITICAL_C = -40   # temp below this -> critical cold alert (frostbite/hypothermia/equipment failure)
@@ -58,7 +62,6 @@ sqlite_conn.execute("""
         node_id TEXT NOT NULL,
         temp REAL,
         humidity REAL,
-        distance REAL,
         battery REAL,
         timestamp REAL NOT NULL
     )
@@ -70,7 +73,7 @@ sqlite_conn.commit()
 # This is the source of truth for GET /nodes. InfluxDB is written to
 # in parallel purely for the time-series graphs.
 # ----------------------------------------------------------------
-# node_id -> {temp, humidity, distance, battery, last_seen, status, history: [battery readings]}
+# node_id -> {temp, humidity, battery, last_seen, status, history: [battery readings]}
 nodes_state = {}
 
 
@@ -133,12 +136,11 @@ def write_event(node_id, event_type, message):
 def write_to_sqlite(node_id, data):
     try:
         sqlite_conn.execute(
-            "INSERT INTO readings (node_id, temp, humidity, distance, battery, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO readings (node_id, temp, humidity, battery, timestamp) VALUES (?, ?, ?, ?, ?)",
             (
                 node_id,
                 data.get("temp"),
                 data.get("humidity"),
-                data.get("distance"),
                 data.get("battery"),
                 time.time(),
             ),
@@ -147,7 +149,26 @@ def write_to_sqlite(node_id, data):
     except Exception as e:
         print(f"[sqlite] write failed for {node_id}: {e}")
 
+def fetch_pi_nodes():
+    '''Fetch node_1's live status from the Pi. Returns [] if Pi is unreachable —
+    Flask should keep serving simulated nodes even if the Pi drops offline.'''
+    try:
+        resp = requests.get(f"{PI_URL}/nodes", timeout=PI_TIMEOUT_SEC)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        print(f"[pi] /nodes fetch failed: {e}")
+        return []
 
+def fetch_pi_alerts():
+    '''Fetch alert events from the Pi. Returns [] if unreachable.'''
+    try:
+        resp = requests.get(f"{PI_URL}/alerts", timeout=PI_TIMEOUT_SEC)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        print(f"[pi] /alerts fetch failed: {e}")
+        return []
 # ----------------------------------------------------------------
 # Routes
 # ----------------------------------------------------------------
@@ -160,7 +181,6 @@ def receive_data():
       "node_id": "node_1",
       "temp": 22.5,
       "humidity": 45.0,
-      "distance": 120.0,
       "battery": 87.0
     }
     Simulator may also send a batch on reconnect:
@@ -192,7 +212,6 @@ def _ingest_reading(node_id, data, now):
     state = nodes_state.setdefault(node_id, {"battery_history": []})
     state["temp"] = data.get("temp")
     state["humidity"] = data.get("humidity")
-    state["distance"] = data.get("distance")
     state["battery"] = data.get("battery")
     state["last_seen"] = now
 
@@ -205,9 +224,7 @@ def _ingest_reading(node_id, data, now):
 
     # Fire alerts on state transitions (avoid spamming one per reading)
     if status == "red" and prev_status != "red":
-        if data.get("distance") is not None and data["distance"] < PROXIMITY_ALERT_CM:
-            write_alert(node_id, "proximity", f"{node_id}: object within {data['distance']}cm", "critical")
-        elif data.get("temp") is not None and data["temp"] > TEMP_ALERT_C:
+        if data.get("temp") is not None and data["temp"] > TEMP_ALERT_C:
             write_alert(node_id, "temperature", f"{node_id}: temperature at {data['temp']}°C", "critical")
         elif data.get("temp") is not None and data["temp"] < TEMP_LOW_CRITICAL_C:
             write_alert(node_id, "temperature_cold", f"{node_id}: extreme cold at {data['temp']}°C — frostbite/equipment failure risk", "critical")
@@ -216,7 +233,7 @@ def _ingest_reading(node_id, data, now):
             write_alert(node_id, "battery", f"{node_id}: battery low at {data['battery']}%", "warning")
         elif data.get("temp") is not None and data["temp"] < TEMP_LOW_WARN_C:
             write_alert(node_id, "temperature_cold", f"{node_id}: cold approaching danger threshold at {data['temp']}°C", "warning")
-            
+
     if not was_known:
         write_event(node_id, "connected", f"{node_id} came online")
 
@@ -224,9 +241,16 @@ def _ingest_reading(node_id, data, now):
 
 
 @app.route("/nodes", methods=["GET"])
+@app.route("/nodes", methods=["GET"])
 def get_nodes():
     now = time.time()
     result = []
+
+    # Real node(s) from the Pi
+    pi_nodes = fetch_pi_nodes()
+    result.extend(pi_nodes)
+
+    # Simulated nodes (node_2 - node_5)
     for node_id, state in nodes_state.items():
         age = now - state.get("last_seen", 0)
         status = "red" if age > OFFLINE_THRESHOLD_SEC else state.get("status", "green")
@@ -234,7 +258,6 @@ def get_nodes():
             "node_id": node_id,
             "temp": state.get("temp"),
             "humidity": state.get("humidity"),
-            "distance": state.get("distance"),
             "battery": state.get("battery"),
             "status": status,
             "seconds_since_seen": round(age, 1),
@@ -246,14 +269,24 @@ def get_nodes():
 @app.route("/alerts", methods=["GET"])
 def get_alerts():
     limit = int(request.args.get("limit", 50))
-    alerts = list(
+    
+    #mongo
+    sim_alerts = list(
         alerts_collection.find({}, {"_id": 0})
         .sort("timestamp", -1)
         .limit(limit)
     )
-    for a in alerts:
+    for a in sim_alerts:
         a["timestamp"] = a["timestamp"].isoformat()
-    return jsonify(alerts)
+        
+    #pi
+    pi_alerts = fetch_pi_alerts()
+
+    combined = sim_alerts + pi_alerts
+    combined.sort(key=lambda a: a.get("timestamp", ""), reverse=True)
+
+    return jsonify(combined[:limit])
+
 
 
 @app.route("/history", methods=["GET"])
@@ -264,13 +297,13 @@ def get_history():
 
     if node_id:
         rows = sqlite_conn.execute(
-            "SELECT node_id, temp, humidity, distance, battery, timestamp FROM readings "
+            "SELECT node_id, temp, humidity, battery, timestamp FROM readings "
             "WHERE node_id = ? ORDER BY timestamp DESC LIMIT ?",
             (node_id, limit),
         ).fetchall()
     else:
         rows = sqlite_conn.execute(
-            "SELECT node_id, temp, humidity, distance, battery, timestamp FROM readings "
+            "SELECT node_id, temp, humidity, battery, timestamp FROM readings "
             "ORDER BY timestamp DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -280,9 +313,8 @@ def get_history():
             "node_id": r[0],
             "temp": r[1],
             "humidity": r[2],
-            "distance": r[3],
-            "battery": r[4],
-            "timestamp": r[5],
+            "battery": r[3],
+            "timestamp": r[4],
         }
         for r in reversed(rows)  # oldest first, easier for charts
     ]
