@@ -2,6 +2,7 @@ import { mockSensorData } from "./data/mockSensorData";
 import { mockAlertData } from "./data/mockAlertData";
 import NodeStatusCard from "./components/NodeStatusCard";
 import AlertFeed from "./components/AlertFeed";
+import TelemetryPanel from "./components/TelemetryPanel";
 
 function App() {
   return (
@@ -13,7 +14,7 @@ function App() {
         <p className="text-slate-500 text-sm">Command Center / Node Status</p>
       </header>
 
-      <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-6 mb-6">
         <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {mockSensorData.map((node) => (
             <NodeStatusCard key={node.node_id} node={node} />
@@ -22,6 +23,8 @@ function App() {
 
         <AlertFeed alerts={mockAlertData} />
       </div>
+
+      <TelemetryPanel />
     </div>
   );
 }
