@@ -14,7 +14,13 @@ import time
 import requests
 
 BACKEND_URL = "http://localhost:5000/data"
-NODE_IDS = ["node_2", "node_3", "node_4", "node_5"]
+NODES = {
+    "node_2": {"location": "Iqaluit", "lat": 63.7467, "lon": -68.5170},
+    "node_3": {"location": "Whitehorse", "lat": 60.7212, "lon": -135.0568},
+    "node_4": {"location": "Resolute", "lat": 74.7069, "lon": -94.8288},
+    "node_5": {"location": "Churchill", "lat": 58.7667, "lon": -94.1667},
+}
+NODE_IDS = list(NODES.keys())
 SEND_INTERVAL_SEC = 2
 
 # Per-node simulated state
@@ -78,11 +84,20 @@ def main():
 
             if s["offline"]:
                 reading["node_id"] = node_id
+                reading["location"] = NODES[node_id]["location"]
+                reading["lat"] = NODES[node_id]["lat"]
+                reading["lon"] = NODES[node_id]["lon"]
                 reading["ts"] = time.time()
                 s["buffer"].append(reading)
                 continue
 
-            payload = {"node_id": node_id, **reading}
+            payload = {
+                "node_id": node_id,
+                "location": NODES[node_id]["location"],
+                "lat": NODES[node_id]["lat"],
+                "lon": NODES[node_id]["lon"],
+                **reading,
+            }
             try:
                 requests.post(BACKEND_URL, json=payload, timeout=3)
             except requests.exceptions.RequestException as e:

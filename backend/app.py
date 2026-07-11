@@ -60,6 +60,9 @@ sqlite_conn.execute("""
     CREATE TABLE IF NOT EXISTS readings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         node_id TEXT NOT NULL,
+        location TEXT,
+        lat REAL,
+        lon REAL,
         temp REAL,
         humidity REAL,
         battery REAL,
@@ -136,9 +139,12 @@ def write_event(node_id, event_type, message):
 def write_to_sqlite(node_id, data):
     try:
         sqlite_conn.execute(
-            "INSERT INTO readings (node_id, temp, humidity, battery, timestamp) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO readings (node_id, location, lat, lon, temp, humidity, battery, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 node_id,
+                data.get("location"),
+                data.get("lat"),
+                data.get("lon"),
                 data.get("temp"),
                 data.get("humidity"),
                 data.get("battery"),
@@ -214,6 +220,10 @@ def _ingest_reading(node_id, data, now):
     state["humidity"] = data.get("humidity")
     state["battery"] = data.get("battery")
     state["last_seen"] = now
+    
+    state["location"] = data.get("location")
+    state["lat"] = data.get("lat")
+    state["lon"] = data.get("lon")
 
     if data.get("battery") is not None:
         state["battery_history"].append((now, float(data["battery"])))
@@ -256,6 +266,9 @@ def get_nodes():
         status = "red" if age > OFFLINE_THRESHOLD_SEC else state.get("status", "green")
         result.append({
             "node_id": node_id,
+            "location": state.get("location"), 
+            "lat": state.get("lat"),
+            "lon": state.get("lon"),
             "temp": state.get("temp"),
             "humidity": state.get("humidity"),
             "battery": state.get("battery"),
@@ -297,13 +310,13 @@ def get_history():
 
     if node_id:
         rows = sqlite_conn.execute(
-            "SELECT node_id, temp, humidity, battery, timestamp FROM readings "
+            "SELECT node_id, location, lat, lon, temp, humidity, battery, timestamp FROM readings "
             "WHERE node_id = ? ORDER BY timestamp DESC LIMIT ?",
             (node_id, limit),
         ).fetchall()
     else:
         rows = sqlite_conn.execute(
-            "SELECT node_id, temp, humidity, battery, timestamp FROM readings "
+            "SELECT node_id, location, lat, lon, temp, humidity, battery, timestamp FROM readings "
             "ORDER BY timestamp DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -311,12 +324,15 @@ def get_history():
     result = [
         {
             "node_id": r[0],
-            "temp": r[1],
-            "humidity": r[2],
-            "battery": r[3],
-            "timestamp": r[4],
+            "location": r[1],
+            "lat": r[2],
+            "lon": r[3],
+            "temp": r[4],
+            "humidity": r[5],
+            "battery": r[6],
+            "timestamp": r[7],
         }
-        for r in reversed(rows)  # oldest first, easier for charts
+        for r in reversed(rows) # oldest first
     ]
     return jsonify(result)
 
