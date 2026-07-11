@@ -9,7 +9,6 @@ import {
   ResponsiveContainer,
   ReferenceLine,
 } from "recharts";
-import { mockEnvironmentalData, mockBatteryData } from "../data/mockTelemetryData";
 import { FLASK_BASE_URL } from "../config";
 
 // Both tabs are live now. Power Systems polls node_4 (simulated, readings
@@ -26,9 +25,10 @@ function formatTimeLabel(unixSeconds) {
 }
 
 // Generic "poll GET /history?node_id=X, map rows, keep last-known-good on
-// failure" hook shared by both charts.
-function useHistoryPoll(nodeId, mapRow, initialData) {
-  const [data, setData] = useState(initialData);
+// failure" hook shared by both charts. Starts empty — no mock fallback —
+// so an empty chart honestly means "no live data yet", not fake numbers.
+function useHistoryPoll(nodeId, mapRow) {
+  const [data, setData] = useState([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -68,28 +68,22 @@ function useHistoryPoll(nodeId, mapRow, initialData) {
 }
 
 function useBatteryHistory() {
-  return useHistoryPoll(
-    "node_4",
-    (r) =>
-      r.battery !== null && r.battery !== undefined
-        ? { time: formatTimeLabel(r.timestamp), battery_pct: r.battery }
-        : null,
-    mockBatteryData
+  return useHistoryPoll("node_4", (r) =>
+    r.battery !== null && r.battery !== undefined
+      ? { time: formatTimeLabel(r.timestamp), battery_pct: r.battery }
+      : null
   );
 }
 
 function useEnvironmentalHistory() {
-  return useHistoryPoll(
-    "node_1",
-    (r) =>
-      r.temp !== null && r.temp !== undefined
-        ? {
-            time: formatTimeLabel(r.timestamp),
-            temperature: r.temp,
-            proximity: r.distance_cm,
-          }
-        : null,
-    mockEnvironmentalData
+  return useHistoryPoll("node_1", (r) =>
+    r.temp !== null && r.temp !== undefined
+      ? {
+          time: formatTimeLabel(r.timestamp),
+          temperature: r.temp,
+          proximity: r.distance_cm,
+        }
+      : null
   );
 }
 
@@ -122,8 +116,19 @@ function LegendDot({ color, label }) {
   );
 }
 
+function ChartPlaceholder() {
+  return (
+    <div className="h-[280px] flex items-center justify-center">
+      <p className="font-mono text-xs text-slate-600 uppercase tracking-wider">
+        Waiting for data...
+      </p>
+    </div>
+  );
+}
+
 function EnvironmentalChart() {
   const data = useEnvironmentalHistory();
+  if (data.length === 0) return <ChartPlaceholder />;
 
   return (
     <ResponsiveContainer width="100%" height={280}>
@@ -156,7 +161,9 @@ function EnvironmentalChart() {
 
 function PowerChart() {
   const data = useBatteryHistory();
-  const latest = data.length > 0 ? data[data.length - 1].battery_pct : 0;
+  if (data.length === 0) return <ChartPlaceholder />;
+
+  const latest = data[data.length - 1].battery_pct;
   const lineColor = latest < 20 ? "#f43f5e" : "#10b981";
 
   return (

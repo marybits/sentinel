@@ -1,5 +1,6 @@
 // Adapts the Flask API's responses into the canonical shapes our
-// components expect. Two real-world wrinkles this papers over:
+// components expect, and owns the live fetch/poll loop against that API.
+// Three real-world wrinkles this papers over:
 //
 // 1. GET /nodes returns a MIXED array: node_1 comes straight from the Pi
 //    (hub/main.c's shape), nodes 2-5 come from the backend's simulator
@@ -7,6 +8,13 @@
 // 2. GET /alerts merges MongoDB alerts (type/severity, ISO timestamp, no
 //    id) with Pi alerts (type/classification, unix timestamp, has id).
 //    normalizeAlert() reconciles both.
+// 3. is_syncing/sync_backlog only exist for simulated nodes (2-5) — the
+//    Pi's own POST /sensor-data protocol has no batch-flush concept yet,
+//    so node_1 never reports a sync in progress. See backend/app.py's
+//    SYNC_DISPLAY_SEC for how long a flush stays visible after it happens.
+
+import { useEffect, useState } from "react";
+import { FLASK_BASE_URL, POLL_INTERVAL_MS } from "../config";
 
 const OFFLINE_AGE_SEC = 15; // mirrors backend/app.py's OFFLINE_THRESHOLD_SEC
 
@@ -44,8 +52,8 @@ export function normalizeNode(raw) {
     proximity_alert: false,
     battery_pct: raw.battery,
     online: (raw.seconds_since_seen ?? Infinity) <= OFFLINE_AGE_SEC,
-    is_syncing: false,
-    sync_backlog: 0,
+    is_syncing: raw.is_syncing ?? false,
+    sync_backlog: raw.sync_backlog ?? 0,
     last_seen: null,
   };
 }
@@ -76,4 +84,71 @@ export function normalizeAlert(raw) {
     severity: raw.severity ?? PI_ALERT_SEVERITY[raw.type] ?? "warning",
     timestamp: toUnixSeconds(raw.timestamp),
   };
+}
+
+// Live data source for the whole dashboard — polls GET /nodes + GET /alerts
+// on Flask every POLL_INTERVAL_MS, normalizes both, and tracks connection
+// state so the UI can distinguish "never connected yet" from "was live,
+// now failing" instead of just going stale silently.
+//
+// connectionStatus:
+//   "connecting"   — no successful poll yet (first load, or Flask down from the start)
+//   "live"         — most recent poll succeeded
+//   "reconnecting" — was live before, current poll is failing (keeps last-known-good data on screen)
+export function useSentinelData() {
+  const [nodes, setNodes] = useState([]);
+  const [alerts, setAlerts] = useState([]);
+  const [connectionStatus, setConnectionStatus] = useState("connecting");
+
+  useEffect(() => {
+    let cancelled = false;
+    let timeoutId;
+    let everConnected = false;
+
+    async function poll() {
+      try {
+        const [nodesRes, alertsRes] = await Promise.all([
+          fetch(`${FLASK_BASE_URL}/nodes`),
+          fetch(`${FLASK_BASE_URL}/alerts`),
+        ]);
+
+        if (!nodesRes.ok || !alertsRes.ok) {
+          throw new Error(`Backend responded ${nodesRes.status}/${alertsRes.status}`);
+        }
+
+        const [rawNodes, rawAlerts] = await Promise.all([
+          nodesRes.json(),
+          alertsRes.json(),
+        ]);
+
+        if (!cancelled) {
+          setNodes(rawNodes.map(normalizeNode));
+          setAlerts(rawAlerts.map(normalizeAlert));
+          setConnectionStatus("live");
+          everConnected = true;
+        }
+      } catch (err) {
+        // Flask unreachable or returned an error — keep showing last-known-good
+        // data (if any) instead of crashing, and surface a status the UI can
+        // render instead of silently going stale.
+        console.error("Poll failed:", err);
+        if (!cancelled) {
+          setConnectionStatus(everConnected ? "reconnecting" : "connecting");
+        }
+      } finally {
+        if (!cancelled) {
+          timeoutId = setTimeout(poll, POLL_INTERVAL_MS);
+        }
+      }
+    }
+
+    poll();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+    };
+  }, []);
+
+  return { nodes, alerts, connectionStatus };
 }

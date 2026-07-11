@@ -38,6 +38,7 @@ SQLITE_PATH = os.environ.get("SQLITE_PATH", "sentinel.db")  # lives next to app.
 
 # alert thresholds
 OFFLINE_THRESHOLD_SEC = 15  # no data for this long -> node marked offline
+SYNC_DISPLAY_SEC = 5        # how long GET /nodes keeps reporting is_syncing after a batch flush
 TEMP_ALERT_C = 20           # temp above this -> high-temp alert (overheating/fire risk)
 TEMP_LOW_WARN_C = -20       # temp below this -> cold warning (battery drain, equipment stress)
 TEMP_LOW_CRITICAL_C = -40   # temp below this -> critical cold alert (frostbite/hypothermia/equipment failure)
@@ -221,6 +222,13 @@ def receive_data():
         readings = data["batch"]
         for r in readings:
             _ingest_reading(node_id, r, now)
+        # Record the flush so GET /nodes can report is_syncing for a few
+        # seconds — the flush itself completes within this single request,
+        # so there's no window where a poll would catch it "in progress";
+        # this is what actually drives the dashboard's sync animation.
+        state = nodes_state.setdefault(node_id, {"battery_history": []})
+        state["last_sync_count"] = len(readings)
+        state["last_sync_at"] = now
         write_event(node_id, "sync", f"{len(readings)} buffered readings synced")
         return jsonify({"status": "ok", "synced": len(readings)}), 200
 
@@ -281,9 +289,13 @@ def get_nodes():
     for node_id, state in nodes_state.items():
         age = now - state.get("last_seen", 0)
         status = "red" if age > OFFLINE_THRESHOLD_SEC else state.get("status", "green")
+
+        last_sync_at = state.get("last_sync_at")
+        is_syncing = last_sync_at is not None and (now - last_sync_at) < SYNC_DISPLAY_SEC
+
         result.append({
             "node_id": node_id,
-            "location": state.get("location"), 
+            "location": state.get("location"),
             "lat": state.get("lat"),
             "lon": state.get("lon"),
             "temp": state.get("temp"),
@@ -292,6 +304,8 @@ def get_nodes():
             "status": status,
             "seconds_since_seen": round(age, 1),
             "battery_minutes_left": estimate_battery_minutes_left(node_id),
+            "is_syncing": is_syncing,
+            "sync_backlog": state.get("last_sync_count", 0) if is_syncing else 0,
         })
     return jsonify(result)
 

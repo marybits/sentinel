@@ -3,9 +3,9 @@
  *
  * QNX 8.0 base station for the Sentinel Arctic sensor network (cuHacking).
  * Receives ESP32/DHT11 readings over HTTP, polls an HC-SR04 over GPIO,
- * triggers the camera + an OpenCV classifier on proximity alerts, persists
- * everything to SQLite, and serves GET /nodes, GET /alerts, and GET /history
- * for Flask.
+ * triggers the camera + an OpenCV classifier on proximity alerts, drives a
+ * WS2812B LED strip as a physical alert indicator, persists everything to
+ * SQLite, and serves GET /nodes, GET /alerts, and GET /history for Flask.
  *
  * Build:  clang -Wall -Wextra -O2 -std=c11 -o hub main.c -lpthread -lsqlite3
  *         (see hub/Makefile)
@@ -20,6 +20,8 @@
  * GPIO note: talks to HC-SR04 over /dev/gpio23 (TRIG) / /dev/gpio24 (ECHO)
  * using a best-effort read/write protocol (see gpio_pin_read/gpio_pin_write);
  * falls back to SENTINEL_GPIO_SIM automatically if the devices won't open.
+ * The WS2812B LED (DIN on /dev/gpio18) uses the same best-effort bit-bang
+ * approach — see the comment above led_send_bit() for its limitations.
  */
 
 #include <stdio.h>
@@ -419,12 +421,18 @@ static void db_write_alert(const alert_t *a) {
 #define GPIO_DEV_PATH_FMT       "/dev/gpio%d"
 #define GPIO_TRIG_PIN            23
 #define GPIO_ECHO_PIN            24
+#define LED_DATA_PIN             18   /* WS2812B DIN, per hardware plan (Pi Pin 12) */
 
 #define HCSR04_TRIG_PULSE_US     10    /* datasheet minimum */
 #define HCSR04_ECHO_TIMEOUT_US   30000 /* ~30ms; also our "nothing in range" bailout */
 
+#define LED_COUNT                8     /* WS2812B stick, 8 pixels */
+#define LED_POLL_INTERVAL_MS     150   /* tick rate for pulse/flash animation */
+#define LED_BRIGHTNESS_DIM       40    /* out of 255 — plenty visible, easy on a shared USB rail */
+
 static int g_gpio_trig_fd = -1;
 static int g_gpio_echo_fd = -1;
+static int g_led_fd = -1;
 
 /* Opens /dev/gpio<pin>. */
 static int gpio_pin_open(int pin, int flags) {
@@ -539,6 +547,142 @@ static double gpio_read_distance_cm(void) {
     double pulse_us = gpio_hw_read_echo_pulse_us();
     if (pulse_us < 0) return -1.0;
     return (pulse_us * 0.0343) / 2.0; /* speed of sound, round trip */
+}
+
+/* ----------------------------------------------------------------
+ * WS2812B LED strip — physical alert indicator on LED_DATA_PIN.
+ *
+ * Bit-banged over the same best-effort /dev/gpio write path used for the
+ * HC-SR04 TRIG pulse above: nanosleep() between writes to approximate the
+ * WS2812B protocol's ~1.25us/bit timing (T0H 400ns/T0L 850ns for a 0,
+ * T1H 800ns/T1L 450ns for a 1, GRB byte order, latched by a >=50us low
+ * "reset" pulse). Userspace nanosleep can't guarantee sub-microsecond
+ * precision, so on marginal hardware individual pixels may glitch — this
+ * is a known limitation of driving WS2812B without PWM+DMA, not a bug.
+ * If the pin can't be opened at all (g_gpio_sim, or hardware not present),
+ * we fall back to logging state transitions only, same pattern as the
+ * ultrasonic sensor's g_gpio_sim fallback.
+ * ---------------------------------------------------------------- */
+
+typedef enum { LED_STATE_GREEN, LED_STATE_YELLOW, LED_STATE_RED } led_state_t;
+
+/* Sends a single WS2812B bit. */
+static void led_send_bit(int fd, int bit) {
+    struct timespec high, low;
+    if (bit) {
+        high = (struct timespec){ .tv_sec = 0, .tv_nsec = 800 };
+        low  = (struct timespec){ .tv_sec = 0, .tv_nsec = 450 };
+    } else {
+        high = (struct timespec){ .tv_sec = 0, .tv_nsec = 400 };
+        low  = (struct timespec){ .tv_sec = 0, .tv_nsec = 850 };
+    }
+    gpio_pin_write(fd, 1);
+    nanosleep(&high, NULL);
+    gpio_pin_write(fd, 0);
+    nanosleep(&low, NULL);
+}
+
+/* Sends one byte MSB-first. */
+static void led_send_byte(int fd, unsigned char b) {
+    for (int i = 7; i >= 0; i--) {
+        led_send_bit(fd, (b >> i) & 1);
+    }
+}
+
+/* Sends LED_COUNT pixels of the same RGB color, then latches with a reset pulse. */
+static void led_show(int fd, unsigned char r, unsigned char g, unsigned char b) {
+    if (fd < 0) return; /* simulated — nothing to drive */
+    for (int i = 0; i < LED_COUNT; i++) {
+        led_send_byte(fd, g); /* WS2812B wants GRB order, not RGB */
+        led_send_byte(fd, r);
+        led_send_byte(fd, b);
+    }
+    struct timespec reset = { .tv_sec = 0, .tv_nsec = 60000 }; /* >=50us low = latch */
+    nanosleep(&reset, NULL);
+}
+
+/* Opens the LED data pin. Returns -1 (simulated mode) on failure — never fatal. */
+static int led_hw_init(void) {
+    int fd = gpio_pin_open(LED_DATA_PIN, O_WRONLY);
+    if (fd < 0) {
+        LOG_WARN("LED strip init failed — running in simulated mode (state changes logged only)");
+        return -1;
+    }
+    gpio_pin_write(fd, 0);
+    LOG_INFO("WS2812B LED strip initialized: DIN=/dev/gpio%d (fd=%d), %d pixels",
+              LED_DATA_PIN, fd, LED_COUNT);
+    return fd;
+}
+
+static void led_hw_cleanup(int fd) {
+    if (fd >= 0) {
+        led_show(fd, 0, 0, 0); /* off on shutdown */
+        close(fd);
+    }
+}
+
+/* Aggregates every known node's current snapshot into one LED state.
+ * Mirrors classify_status()/check_thresholds_and_alert()'s thresholds so
+ * the physical LED never disagrees with what triggered an alert. */
+static led_state_t compute_led_state(void) {
+    led_state_t worst = LED_STATE_GREEN;
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&g_nodes_lock);
+    for (int i = 0; i < MAX_NODES; i++) {
+        node_state_t *n = &g_nodes[i];
+        if (!n->in_use) continue;
+
+        int offline = (now - n->last_seen) >= NODE_OFFLINE_SEC;
+        int critical = offline ||
+                       (n->has_distance && n->proximity_alert) ||
+                       (n->has_temperature && (n->temperature_c > TEMP_HIGH_C || n->temperature_c < TEMP_LOW_C));
+        int warning = !critical && n->has_temperature && n->humidity_pct > HUMIDITY_HIGH_PCT;
+
+        if (critical) { worst = LED_STATE_RED; break; }
+        if (warning && worst == LED_STATE_GREEN) worst = LED_STATE_YELLOW;
+    }
+    pthread_mutex_unlock(&g_nodes_lock);
+
+    return worst;
+}
+
+/* Drives the LED strip: solid dim green when clear, pulsing amber on a
+ * warning, flashing red on a critical alert. Runs until g_shutdown. */
+static void *led_poll_thread(void *arg) {
+    (void)arg;
+    int fd = led_hw_init();
+    led_state_t last_logged = LED_STATE_GREEN;
+    int tick_on = 1;
+
+    LOG_INFO("LED polling thread started (interval=%dms)", LED_POLL_INTERVAL_MS);
+
+    while (!g_shutdown) {
+        led_state_t state = compute_led_state();
+        if (state != last_logged) {
+            static const char *names[] = { "GREEN", "YELLOW", "RED" };
+            LOG_INFO("LED state -> %s", names[state]);
+            last_logged = state;
+        }
+
+        switch (state) {
+            case LED_STATE_GREEN:
+                led_show(fd, 0, LED_BRIGHTNESS_DIM, 0);
+                break;
+            case LED_STATE_YELLOW: /* slow pulse */
+                led_show(fd, tick_on ? LED_BRIGHTNESS_DIM : 0, tick_on ? (LED_BRIGHTNESS_DIM * 3 / 4) : 0, 0);
+                break;
+            case LED_STATE_RED: /* fast flash */
+                led_show(fd, tick_on ? LED_BRIGHTNESS_DIM : 0, 0, 0);
+                break;
+        }
+        tick_on = !tick_on;
+
+        usleep(LED_POLL_INTERVAL_MS * 1000);
+    }
+
+    led_hw_cleanup(fd);
+    return NULL;
 }
 
 /* Runs the OpenCV classifier command with a timeout, returns malloc'd stdout or NULL. */
@@ -1179,6 +1323,13 @@ int main(void) {
         return 1;
     }
     pthread_detach(gpio_tid);
+
+    pthread_t led_tid;
+    if (pthread_create(&led_tid, NULL, led_poll_thread, NULL) != 0) {
+        LOG_ERR("Failed to start LED polling thread: %s — continuing without physical alerts", strerror(errno));
+    } else {
+        pthread_detach(led_tid);
+    }
 
     run_http_server();
 
