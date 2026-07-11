@@ -3,6 +3,7 @@ import { mockAlertData } from "./data/mockAlertData";
 import NodeStatusCard from "./components/NodeStatusCard";
 import AlertFeed from "./components/AlertFeed";
 import TelemetryPanel from "./components/TelemetryPanel";
+import ArcticMap from "./components/ArcticMap";
 
 function App() {
   return (
@@ -24,7 +25,10 @@ function App() {
         <AlertFeed alerts={mockAlertData} />
       </div>
 
-      <TelemetryPanel />
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <TelemetryPanel />
+        <ArcticMap />
+      </div>
     </div>
   );
 }

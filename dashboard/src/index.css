@@ -1,1 +1,30 @@
-@import "tailwindcss"; 
+@import "tailwindcss";
+
+.leaflet-container {
+  background-color: #020617;
+}
+
+.leaflet-popup-content-wrapper {
+  background-color: #0f172a;
+  color: #cbd5e1;
+  border: 1px solid #1e293b;
+  border-radius: 2px;
+}
+
+.leaflet-popup-tip {
+  background-color: #0f172a;
+  border: 1px solid #1e293b;
+}
+
+.leaflet-popup-close-button {
+  color: #64748b !important;
+}
+
+.leaflet-control-attribution {
+  background-color: rgba(15, 23, 42, 0.8) !important;
+  color: #64748b !important;
+}
+
+.leaflet-control-attribution a {
+  color: #94a3b8 !important;
+}
