@@ -447,7 +447,7 @@ static void db_write_alert(const alert_t *a) {
     pthread_mutex_unlock(&g_db_lock);
 }
 
-#define GPIO_DEV_PATH_FMT       "/dev/gpio%d"
+#define GPIO_DEV_PATH_FMT       "/dev/gpio/%d"
 #define LED_DATA_PIN             18   /* WS2812B DIN, per hardware plan (Pi Pin 12) */
 
 #define LED_COUNT                8     /* WS2812B stick, 8 pixels */

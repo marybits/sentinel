@@ -276,7 +276,6 @@ def _ingest_reading(node_id, data, now):
 
 
 @app.route("/nodes", methods=["GET"])
-@app.route("/nodes", methods=["GET"])
 def get_nodes():
     now = time.time()
     result = []
