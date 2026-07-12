@@ -20,10 +20,6 @@
 # present in this directory at runtime (copy it from wherever
 # train_synthetic_model.py wrote it) or every proximity alert will
 # classify as "unknown".
-#
-# capture_snapshot.c / opencv_classify.py are LEFTOVER from an earlier
-# camera-based pivot and are no longer built or invoked by hub — safe to
-# delete once you're sure you don't need them.
 
 CC      = clang
 CFLAGS  = -Wall -Wextra -O2 -std=c11 -D_POSIX_C_SOURCE=200809L

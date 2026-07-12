@@ -28,7 +28,7 @@ export default function NodeStatusCard({ node }) {
       </div>
 
       <div className="grid grid-cols-2 gap-2 font-mono text-sm">
-        <Metric label="TEMP" value={`${node.temperature_c.toFixed(1)}°C`} />
+        <Metric label="TEMP" value={`${(node.temperature_c ?? 0).toFixed(1)}°C`} />
         <Metric label="HUM" value={`${node.humidity_pct}%`} />
         {node.distance_cm !== null && <Metric label="DIST" value={`${node.distance_cm}cm`} />}
         {node.battery_pct !== null && <Metric label="BATT" value={`${node.battery_pct}%`} />}

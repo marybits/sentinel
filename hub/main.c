@@ -500,6 +500,14 @@ static void json_escape(const char *src, char *dst, size_t dst_sz) {
  * spawn, no model reload. g_radar_lock serializes access since HTTP
  * requests are handled one thread per connection, but the classifier
  * only understands one request at a time on its pipes.
+ *
+ * Every fork() below hands the child a copy of every fd hub has open at
+ * that moment (exec() doesn't close them unless they're FD_CLOEXEC) —
+ * the listening socket and any in-flight client connection are marked
+ * FD_CLOEXEC in run_http_server() so classifier restarts mid-request
+ * don't leak them in. The SQLite fd (opened inside sqlite3_open(), no
+ * portable way to reach in and flag it) is a known minor exception —
+ * infer_radar.py never touches it, so it's inert, just untidy.
  * ---------------------------------------------------------------- */
 
 static pid_t            g_radar_pid   = -1;
