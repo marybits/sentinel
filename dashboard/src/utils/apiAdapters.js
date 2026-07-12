@@ -12,6 +12,10 @@
 //    Pi's own POST /sensor-data protocol has no batch-flush concept yet,
 //    so node_1 never reports a sync in progress. See backend/app.py's
 //    SYNC_DISPLAY_SEC for how long a flush stays visible after it happens.
+// 4. distance_history/ai_classification only exist for node_1 (the radar
+//    movement classifier — see hub/main.c's trigger_radar_classification
+//    and RadarTelemetry.jsx). Flask passes the Pi's GET /nodes response
+//    through untouched, so these fields need no backend changes at all.
 
 import { useEffect, useState } from "react";
 import { FLASK_BASE_URL, POLL_INTERVAL_MS } from "../config";
@@ -36,6 +40,8 @@ export function normalizeNode(raw) {
       is_syncing: false,
       sync_backlog: 0,
       last_seen: raw.last_seen,
+      distance_history: raw.distance_history ?? [],
+      ai_classification: raw.ai_classification || "unknown",
     };
   }
 

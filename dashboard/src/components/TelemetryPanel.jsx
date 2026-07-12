@@ -10,12 +10,18 @@ import {
   ReferenceLine,
 } from "recharts";
 import { FLASK_BASE_URL } from "../config";
+import RadarTelemetry from "./RadarTelemetry";
 
-// Both tabs are live now. Power Systems polls node_4 (simulated, readings
-// land in Flask's SQLite `readings` table via POST /data). Environmental
-// polls node_1 — its temp/humidity/distance history lives in the Pi's own
-// sensor_data table, so Flask's GET /history proxies node_1 requests to the
-// Pi's GET /history route instead of querying the local table.
+// Power Systems polls node_4 (simulated, readings land in Flask's SQLite
+// `readings` table via POST /data) via GET /history, same as before.
+//
+// The old Environmental tab (temp+proximity chart for node_1, via its own
+// GET /history poll) is gone — node_1 pivoted from a Pi Camera+OpenCV
+// intruder classifier to an HC-SR04 + TFLite movement classifier. That
+// data (distance_history/ai_classification) rides along on the same
+// GET /nodes poll that already drives the node cards/map (see
+// apiAdapters.js's useSentinelData), so it's passed in via the `nodes`
+// prop instead of a second independent poll.
 const HISTORY_POLL_MS = 5000;
 const HISTORY_LIMIT = 40;
 
@@ -25,8 +31,8 @@ function formatTimeLabel(unixSeconds) {
 }
 
 // Generic "poll GET /history?node_id=X, map rows, keep last-known-good on
-// failure" hook shared by both charts. Starts empty — no mock fallback —
-// so an empty chart honestly means "no live data yet", not fake numbers.
+// failure" hook. Starts empty — no mock fallback — so an empty chart
+// honestly means "no live data yet", not fake numbers.
 function useHistoryPoll(nodeId, mapRow) {
   const [data, setData] = useState([]);
 
@@ -75,18 +81,6 @@ function useBatteryHistory() {
   );
 }
 
-function useEnvironmentalHistory() {
-  return useHistoryPoll("node_1", (r) =>
-    r.temp !== null && r.temp !== undefined
-      ? {
-          time: formatTimeLabel(r.timestamp),
-          temperature: r.temp,
-          proximity: r.distance_cm,
-        }
-      : null
-  );
-}
-
 const AXIS_TICK_STYLE = {
   fill: "#94a3b8",
   fontFamily: "monospace",
@@ -103,18 +97,9 @@ const TOOLTIP_STYLE = {
 };
 
 const TABS = [
-  { id: "environmental", label: "ENVIRONMENTAL" },
+  { id: "radar", label: "RADAR" },
   { id: "power", label: "POWER SYSTEMS" },
 ];
-
-function LegendDot({ color, label }) {
-  return (
-    <span className="flex items-center gap-1.5">
-      <span className="h-2 w-2 rounded-full" style={{ backgroundColor: color }} />
-      <span className="font-mono text-[10px] text-slate-500 uppercase tracking-wider">{label}</span>
-    </span>
-  );
-}
 
 function ChartPlaceholder() {
   return (
@@ -123,39 +108,6 @@ function ChartPlaceholder() {
         Waiting for data...
       </p>
     </div>
-  );
-}
-
-function EnvironmentalChart() {
-  const data = useEnvironmentalHistory();
-  if (data.length === 0) return <ChartPlaceholder />;
-
-  return (
-    <ResponsiveContainer width="100%" height={280}>
-      <LineChart data={data}>
-        <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" />
-        <XAxis dataKey="time" tick={AXIS_TICK_STYLE} axisLine={AXIS_LINE} tickLine={AXIS_LINE} />
-        <YAxis
-          yAxisId="temp"
-          tick={AXIS_TICK_STYLE}
-          axisLine={AXIS_LINE}
-          tickLine={AXIS_LINE}
-          label={{ value: "°C", angle: -90, position: "insideLeft", fill: "#94a3b8", fontSize: 12 }}
-        />
-        <YAxis
-          yAxisId="prox"
-          orientation="right"
-          tick={AXIS_TICK_STYLE}
-          axisLine={AXIS_LINE}
-          tickLine={AXIS_LINE}
-          label={{ value: "cm", angle: 90, position: "insideRight", fill: "#94a3b8", fontSize: 12 }}
-        />
-        <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={{ color: "#94a3b8" }} />
-        <ReferenceLine yAxisId="prox" y={30} stroke="#f43f5e" strokeDasharray="4 4" />
-        <Line yAxisId="temp" type="monotone" dataKey="temperature" stroke="#10b981" strokeWidth={2} dot={false} />
-        <Line yAxisId="prox" type="monotone" dataKey="proximity" stroke="#f59e0b" strokeWidth={2} dot={false} />
-      </LineChart>
-    </ResponsiveContainer>
   );
 }
 
@@ -191,8 +143,9 @@ function PowerChart() {
   );
 }
 
-export default function TelemetryPanel() {
-  const [activeTab, setActiveTab] = useState("environmental");
+export default function TelemetryPanel({ nodes = [] }) {
+  const [activeTab, setActiveTab] = useState("radar");
+  const node1 = nodes.find((n) => n.node_id === "node_1");
 
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-sm p-4">
@@ -212,19 +165,13 @@ export default function TelemetryPanel() {
         ))}
       </div>
 
-      {activeTab === "environmental" ? (
-        <>
-          <div className="flex items-center justify-between mb-2">
-            <p className="font-mono text-[10px] text-slate-500 uppercase tracking-wider">
-              NODE_1 · INUVIK (live)
-            </p>
-            <div className="flex items-center gap-4">
-              <LegendDot color="#10b981" label="Temperature" />
-              <LegendDot color="#f59e0b" label="Proximity" />
-            </div>
-          </div>
-          <EnvironmentalChart />
-        </>
+      {activeTab === "radar" ? (
+        <RadarTelemetry
+          distanceHistory={node1?.distance_history}
+          aiClassification={node1?.ai_classification}
+          nodeId="node_1"
+          location={node1?.location ?? "Inuvik"}
+        />
       ) : (
         <>
           <p className="font-mono text-[10px] text-slate-500 uppercase tracking-wider mb-2">

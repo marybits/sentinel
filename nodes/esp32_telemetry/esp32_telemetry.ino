@@ -15,6 +15,18 @@ const char* serverName = "http://172.20.10.9:8080/sensor-data";
 #define DHTTYPE DHT11
 DHT dht(DHTPIN, DHTTYPE);
 
+// --- HC-SR04 PROXIMITY SENSOR CONFIGURATION ---
+// PLAN B PIVOT: this used to be wired straight to the Pi's own GPIO
+// (TRIG=23/ECHO=24 on the Pi), polled from a QNX thread. The Pi's VFS
+// added too much latency for reliable microsecond-scale echo timing, so
+// the sensor moved here, alongside the DHT11 on the same ESP32 — same
+// pins as the ORIGINAL hackathon plan (TRIG=GPIO5, ECHO=GPIO18), just no
+// longer routed through ESP-NOW/a gateway board, straight WiFi like the
+// DHT11 already was.
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+#define HCSR04_TIMEOUT_US 30000UL  // ~30ms round-trip ceiling = "nothing in range"
+
 // --- NODE IDENTITY ---
 // Must be "node_1" — hub/main.c only knows Arctic coordinates for
 // node_1..node_5. Any other node_id gets seeded with lat/lon 0,0.
@@ -27,28 +39,55 @@ const char* nodeLocation = "Inuvik";
 struct BufferedReading {
   float temperature;
   float humidity;
+  float distanceCm;
+  bool hasDistance;  // false when the HC-SR04 timed out (nothing in range)
 };
 #define BUFFER_CAPACITY 40
 BufferedReading buffer[BUFFER_CAPACITY];
 int bufferCount = 0;
 
+// Pulses TRIG and times the ECHO response. Returns distance in cm, or -1
+// on timeout (nothing in range, or the sensor isn't responding) — caller
+// must check for -1 rather than send it as a real reading, since a
+// negative "distance" would look like an extreme proximity breach to the
+// hub instead of "no echo".
+float readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, HCSR04_TIMEOUT_US);
+  if (duration == 0) {
+    return -1.0;  // pulseIn timed out
+  }
+  return (duration * 0.0343) / 2.0;  // speed of sound, round trip
+}
+
 // Pushes a reading into the buffer, dropping the oldest if full.
-void bufferPush(float temperature, float humidity) {
+void bufferPush(float temperature, float humidity, float distanceCm, bool hasDistance) {
   if (bufferCount >= BUFFER_CAPACITY) {
     for (int i = 1; i < BUFFER_CAPACITY; i++) buffer[i - 1] = buffer[i];
     bufferCount--;
     Serial.println("Buffer full — dropped oldest reading.");
   }
-  buffer[bufferCount++] = { temperature, humidity };
+  buffer[bufferCount++] = { temperature, humidity, distanceCm, hasDistance };
 }
 
-// POSTs one reading to the hub. Returns true on HTTP 2xx.
-bool sendReading(float temperature, float humidity) {
+// POSTs one reading to the hub. Returns true on HTTP 2xx. distance_cm is
+// only included in the JSON when hasDistance is true — omitting it (vs.
+// sending a bogus negative number) keeps a sensor timeout from looking
+// like a proximity breach to hub/main.c's threshold check.
+bool sendReading(float temperature, float humidity, float distanceCm, bool hasDistance) {
   StaticJsonDocument<200> doc;
   doc["node_id"] = nodeId;
   doc["location"] = nodeLocation;
   doc["temperature"] = temperature;
   doc["humidity"] = humidity;
+  if (hasDistance) {
+    doc["distance_cm"] = distanceCm;
+  }
 
   String jsonRaw;
   serializeJson(doc, jsonRaw);
@@ -82,7 +121,8 @@ bool sendReading(float temperature, float humidity) {
 void flushBuffer() {
   int sent = 0;
   while (sent < bufferCount) {
-    if (!sendReading(buffer[sent].temperature, buffer[sent].humidity)) break;
+    BufferedReading r = buffer[sent];
+    if (!sendReading(r.temperature, r.humidity, r.distanceCm, r.hasDistance)) break;
     sent++;
   }
   if (sent > 0) {
@@ -97,6 +137,10 @@ void flushBuffer() {
 void setup() {
   Serial.begin(115200);
   dht.begin();
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
 
   WiFi.mode(WIFI_STA);
   Serial.print("Connecting to SSID: ");
@@ -124,8 +168,14 @@ void loop() {
     return;
   }
 
+  float distance = readDistanceCm();
+  bool hasDistance = (distance >= 0);
+  if (!hasDistance) {
+    Serial.println("HC-SR04: no echo (out of range) — sending temp/humidity only this cycle.");
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
-    bufferPush(temperature, humidity);
+    bufferPush(temperature, humidity, distance, hasDistance);
     Serial.print("WiFi down — reading buffered (");
     Serial.print(bufferCount);
     Serial.println(" pending). Reconnecting...");
@@ -136,12 +186,16 @@ void loop() {
 
   flushBuffer();
 
-  if (!sendReading(temperature, humidity)) {
-    bufferPush(temperature, humidity);
+  if (!sendReading(temperature, humidity, distance, hasDistance)) {
+    bufferPush(temperature, humidity, distance, hasDistance);
     Serial.print("Reading buffered (");
     Serial.print(bufferCount);
     Serial.println(" pending).");
   }
 
-  delay(5000);
+  // 1s cadence — hub/main.c's radar classifier wants a window of the last
+  // 10 readings to mean something time-wise, and this sits right at
+  // DHT11's own minimum ~1s sampling interval (don't go faster than this
+  // or the DHT11 reads start failing).
+  delay(1000);
 }

@@ -2,18 +2,24 @@
  * Sentinel Hub
  *
  * QNX 8.0 base station for the Sentinel Arctic sensor network (cuHacking).
- * Receives ESP32/DHT11 readings over HTTP, polls an HC-SR04 over GPIO,
+ * Receives ESP32 DHT11+HC-SR04 readings over HTTP (POST /sensor-data),
  * classifies the last 10 distance readings with a tiny on-device ML model
  * (radar_model.tflite via infer_radar.py) on proximity alerts, drives a
  * WS2812B LED strip as a physical alert indicator, persists everything to
  * SQLite, and serves GET /nodes, GET /alerts, and GET /history for Flask.
  *
- * No camera/OpenCV involved — an earlier pivot used the Pi Camera +
- * OpenCV for intruder classification, but we're on ultrasonic-only now:
- * the HC-SR04's last 10 readings (2s of pings, one every 500ms — see
- * GPIO_POLL_INTERVAL_MS) get fed to a small MLP that classifies the
- * movement pattern behind a proximity breach (static/noise, direct
- * approach, or passing by) instead of a visual classification.
+ * PLAN B PIVOT: the HC-SR04 used to be wired directly to this Pi's GPIO
+ * (TRIG=23/ECHO=24), polled in a dedicated thread. QNX's VFS latency made
+ * the microsecond-scale echo timing unreliable, so the sensor moved to
+ * the ESP32 alongside the DHT11 — it now arrives as `distance_cm` in the
+ * same JSON POST as temperature/humidity, no local GPIO polling at all.
+ * See node_state_t.distance_history / push_distance_history_locked().
+ *
+ * No camera/OpenCV involved either — an earlier pivot used the Pi Camera
+ * for intruder classification; that's gone too, replaced by the ultrasonic
+ * movement classifier: the last 10 distance readings get fed to a small
+ * MLP that classifies the pattern behind a proximity breach (static/noise,
+ * direct approach, or passing by) instead of a visual classification.
  *
  * Build:  clang -Wall -Wextra -O2 -std=c11 -o hub main.c -lpthread -lsqlite3
  *         (see hub/Makefile)
@@ -22,15 +28,12 @@
  * Env vars:
  *   SENTINEL_HTTP_PORT   HTTP port                (default 8080)
  *   SENTINEL_DB_PATH     SQLite DB path            (default $HOME/sentinel/sentinel.db)
- *   SENTINEL_GPIO_SIM    force simulated HC-SR04   (default 0, real GPIO)
  *   SENTINEL_RADAR_CMD   movement classifier cmd   (default ./infer_radar.py,
  *                          see hub/infer_radar.py + ml/train_synthetic_model.py)
  *
- * GPIO note: talks to HC-SR04 over /dev/gpio23 (TRIG) / /dev/gpio24 (ECHO)
- * using a best-effort read/write protocol (see gpio_pin_read/gpio_pin_write);
- * falls back to SENTINEL_GPIO_SIM automatically if the devices won't open.
- * The WS2812B LED (DIN on /dev/gpio18) uses the same best-effort bit-bang
- * approach — see the comment above led_send_bit() for its limitations.
+ * GPIO note: the only physical GPIO left on this Pi is the WS2812B LED
+ * (DIN on /dev/gpio18) — best-effort bit-bang over gpio_pin_write(), see
+ * the comment above led_send_bit() for its limitations.
  */
 
 #include <stdio.h>
@@ -64,7 +67,6 @@
 #define TEMP_LOW_C               (-10.0)
 #define HUMIDITY_HIGH_PCT        80.0
 #define NODE_OFFLINE_SEC         10
-#define GPIO_POLL_INTERVAL_MS    500
 #define ALERT_COOLDOWN_SEC       15 /* min seconds between repeats of the same alert */
 #define CLASSIFIER_TIMEOUT_SEC   5
 #define ALERTS_RESPONSE_LIMIT    20
@@ -74,7 +76,6 @@
 static int   g_http_port      = DEFAULT_HTTP_PORT;
 static char  g_db_path[512];
 static char  g_radar_cmd[256];
-static int   g_gpio_sim       = 1;
 
 static sqlite3          *g_db = NULL;
 static pthread_mutex_t   g_db_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -101,7 +102,7 @@ static void log_line(const char *level, const char *fmt, ...) {
 #define LOG_WARN(...)  log_line("WARN", __VA_ARGS__)
 #define LOG_ERR(...)   log_line("ERROR", __VA_ARGS__)
 
-#define DISTANCE_HISTORY_LEN 10 /* 2s of HC-SR04 pings at GPIO_POLL_INTERVAL_MS=500 */
+#define DISTANCE_HISTORY_LEN 10 /* readings, one per ESP32 POST (~1s apart -> ~10s window) */
 
 typedef struct {
     char   node_id[32];
@@ -112,6 +113,9 @@ typedef struct {
     double distance_cm;
     double distance_history[DISTANCE_HISTORY_LEN]; /* ring buffer, oldest first */
     int    distance_history_count;                  /* < LEN until the buffer fills once */
+    char   ai_classification[32]; /* last radar_model.tflite verdict — "", "static",
+                                      "approaching", "passing", or "unknown"; persists
+                                      between requests until the next proximity breach */
     int    has_temperature;
     int    has_distance;
     int    proximity_alert;
@@ -444,22 +448,16 @@ static void db_write_alert(const alert_t *a) {
 }
 
 #define GPIO_DEV_PATH_FMT       "/dev/gpio%d"
-#define GPIO_TRIG_PIN            23
-#define GPIO_ECHO_PIN            24
 #define LED_DATA_PIN             18   /* WS2812B DIN, per hardware plan (Pi Pin 12) */
-
-#define HCSR04_TRIG_PULSE_US     10    /* datasheet minimum */
-#define HCSR04_ECHO_TIMEOUT_US   30000 /* ~30ms; also our "nothing in range" bailout */
 
 #define LED_COUNT                8     /* WS2812B stick, 8 pixels */
 #define LED_POLL_INTERVAL_MS     150   /* tick rate for pulse/flash animation */
 #define LED_BRIGHTNESS_DIM       40    /* out of 255 — plenty visible, easy on a shared USB rail */
 
-static int g_gpio_trig_fd = -1;
-static int g_gpio_echo_fd = -1;
 static int g_led_fd = -1;
 
-/* Opens /dev/gpio<pin>. */
+/* Opens /dev/gpio<pin>. Only used for the LED now — the HC-SR04 moved to
+ * the ESP32 in the Plan B pivot, no more TRIG/ECHO pins on this Pi. */
 static int gpio_pin_open(int pin, int flags) {
     char path[32];
     snprintf(path, sizeof(path), GPIO_DEV_PATH_FMT, pin);
@@ -481,112 +479,17 @@ static int gpio_pin_write(int fd, int value) {
     return -1;
 }
 
-/* Samples an input pin's current level (0/1), or -1 on error. */
-static int gpio_pin_read(int fd) {
-    lseek(fd, 0, SEEK_SET);
-    unsigned char b;
-    ssize_t n = read(fd, &b, 1);
-    if (n != 1) return -1;
-    if (b == '0') return 0;
-    if (b == '1') return 1;
-    return b ? 1 : 0;
-}
-
-/* Opens the TRIG/ECHO GPIO devices. */
-static int gpio_hw_init(void) {
-    g_gpio_trig_fd = gpio_pin_open(GPIO_TRIG_PIN, O_WRONLY);
-    if (g_gpio_trig_fd < 0) return -1;
-
-    g_gpio_echo_fd = gpio_pin_open(GPIO_ECHO_PIN, O_RDONLY);
-    if (g_gpio_echo_fd < 0) {
-        close(g_gpio_trig_fd);
-        g_gpio_trig_fd = -1;
-        return -1;
-    }
-
-    gpio_pin_write(g_gpio_trig_fd, 0);
-
-    LOG_INFO("GPIO initialized: TRIG=/dev/gpio%d (fd=%d), ECHO=/dev/gpio%d (fd=%d)",
-              GPIO_TRIG_PIN, g_gpio_trig_fd, GPIO_ECHO_PIN, g_gpio_echo_fd);
-    return 0;
-}
-
-/* Closes the GPIO devices. */
-static void gpio_hw_cleanup(void) {
-    if (g_gpio_trig_fd >= 0) { close(g_gpio_trig_fd); g_gpio_trig_fd = -1; }
-    if (g_gpio_echo_fd >= 0) { close(g_gpio_echo_fd); g_gpio_echo_fd = -1; }
-}
-
-/* Microsecond delta between two timespecs. */
-static double timespec_diff_us(const struct timespec *start, const struct timespec *end) {
-    return (double)(end->tv_sec - start->tv_sec) * 1e6 +
-           (double)(end->tv_nsec - start->tv_nsec) / 1e3;
-}
-
-/* Pulses TRIG and times the ECHO response in microseconds, or -1 on timeout. */
-static double gpio_hw_read_echo_pulse_us(void) {
-    if (g_gpio_trig_fd < 0 || g_gpio_echo_fd < 0) return -1.0;
-
-    gpio_pin_write(g_gpio_trig_fd, 1);
-    struct timespec pulse = { .tv_sec = 0, .tv_nsec = HCSR04_TRIG_PULSE_US * 1000L };
-    nanosleep(&pulse, NULL);
-    gpio_pin_write(g_gpio_trig_fd, 0);
-
-    struct timespec t0, t_now, echo_start;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-
-    int level;
-    do {
-        level = gpio_pin_read(g_gpio_echo_fd);
-        clock_gettime(CLOCK_MONOTONIC, &t_now);
-        if (timespec_diff_us(&t0, &t_now) > HCSR04_ECHO_TIMEOUT_US) return -1.0;
-    } while (level != 1);
-    echo_start = t_now;
-
-    do {
-        level = gpio_pin_read(g_gpio_echo_fd);
-        clock_gettime(CLOCK_MONOTONIC, &t_now);
-        if (timespec_diff_us(&echo_start, &t_now) > HCSR04_ECHO_TIMEOUT_US) return -1.0;
-    } while (level != 0);
-
-    return timespec_diff_us(&echo_start, &t_now);
-}
-
-static int gpio_sim_seeded = 0;
-
-/* Simulated HC-SR04 reading, occasionally dipping under the alert threshold. */
-static double gpio_sim_next_distance_cm(void) {
-    if (!gpio_sim_seeded) { srand((unsigned int)time(NULL)); gpio_sim_seeded = 1; }
-    int roll = rand() % 100;
-    if (roll < 8) {
-        return 5.0 + (rand() % 25);
-    }
-    return 60.0 + (rand() % 200);
-}
-
-/* Returns distance in cm (real or simulated), or -1.0 on read failure. */
-static double gpio_read_distance_cm(void) {
-    if (g_gpio_sim) {
-        return gpio_sim_next_distance_cm();
-    }
-    double pulse_us = gpio_hw_read_echo_pulse_us();
-    if (pulse_us < 0) return -1.0;
-    return (pulse_us * 0.0343) / 2.0; /* speed of sound, round trip */
-}
-
 /* ----------------------------------------------------------------
  * WS2812B LED strip — physical alert indicator on LED_DATA_PIN.
  *
- * Bit-banged over the same best-effort /dev/gpio write path used for the
- * HC-SR04 TRIG pulse above: nanosleep() between writes to approximate the
- * WS2812B protocol's ~1.25us/bit timing (T0H 400ns/T0L 850ns for a 0,
- * T1H 800ns/T1L 450ns for a 1, GRB byte order, latched by a >=50us low
- * "reset" pulse). Userspace nanosleep can't guarantee sub-microsecond
- * precision, so on marginal hardware individual pixels may glitch — this
- * is a known limitation of driving WS2812B without PWM+DMA, not a bug.
- * If the pin can't be opened at all (g_gpio_sim, or hardware not present),
- * we fall back to logging state transitions only, same pattern as the
- * ultrasonic sensor's g_gpio_sim fallback.
+ * Bit-banged over gpio_pin_write() above: nanosleep() between writes to
+ * approximate the WS2812B protocol's ~1.25us/bit timing (T0H 400ns/T0L
+ * 850ns for a 0, T1H 800ns/T1L 450ns for a 1, GRB byte order, latched by
+ * a >=50us low "reset" pulse). Userspace nanosleep can't guarantee
+ * sub-microsecond precision, so on marginal hardware individual pixels
+ * may glitch — this is a known limitation of driving WS2812B without
+ * PWM+DMA, not a bug. If the pin can't be opened at all (hardware not
+ * present), we fall back to logging state transitions only.
  * ---------------------------------------------------------------- */
 
 typedef enum { LED_STATE_GREEN, LED_STATE_YELLOW, LED_STATE_RED } led_state_t;
@@ -746,27 +649,26 @@ static char *run_classifier_with_timeout(const char *cmd, int timeout_sec) {
 }
 
 /* Classifies the movement pattern behind a proximity breach using the
- * node's last DISTANCE_HISTORY_LEN readings (~2s of pings) and pushes a
- * proximity alert with the result. Shells out to infer_radar.py (a tiny
- * tflite_runtime MLP trained by ml/train_synthetic_model.py) via
+ * node's last DISTANCE_HISTORY_LEN readings (~10s of ESP32 POSTs) and
+ * pushes a proximity alert with the result. Shells out to infer_radar.py
+ * (a tiny tflite_runtime MLP trained by ml/train_synthetic_model.py) via
  * run_classifier_with_timeout, passing the window as CLI args — no
  * camera/OpenCV involved, this is ultrasonic-only. */
-static void trigger_radar_classification(const char *node_id, double distance_cm,
-                                          const double *history, int history_count) {
-    LOG_INFO("Perimeter breach on %s (%.1fcm) — classifying movement pattern", node_id, distance_cm);
+static void trigger_radar_classification(node_state_t *n) {
+    LOG_INFO("Perimeter breach on %s (%.1fcm) — classifying movement pattern", n->node_id, n->distance_cm);
 
     double window[DISTANCE_HISTORY_LEN];
-    if (history_count >= DISTANCE_HISTORY_LEN) {
-        memcpy(window, history, sizeof(window));
+    if (n->distance_history_count >= DISTANCE_HISTORY_LEN) {
+        memcpy(window, n->distance_history, sizeof(window));
     } else {
         /* Buffer isn't full yet (e.g. right after startup) — pad the
          * front by repeating the earliest sample so the model always
          * gets a fixed DISTANCE_HISTORY_LEN-length window, same as what
          * it was trained on. */
-        double pad = history_count > 0 ? history[0] : distance_cm;
-        int missing = DISTANCE_HISTORY_LEN - history_count;
+        double pad = n->distance_history_count > 0 ? n->distance_history[0] : n->distance_cm;
+        int missing = DISTANCE_HISTORY_LEN - n->distance_history_count;
         for (int i = 0; i < missing; i++) window[i] = pad;
-        for (int i = 0; i < history_count; i++) window[missing + i] = history[i];
+        for (int i = 0; i < n->distance_history_count; i++) window[missing + i] = n->distance_history[i];
     }
 
     char cmd[512];
@@ -778,9 +680,14 @@ static void trigger_radar_classification(const char *node_id, double distance_cm
     char *classification = run_classifier_with_timeout(cmd, CLASSIFIER_TIMEOUT_SEC);
     const char *cls = classification ? classification : "unknown";
 
-    push_alert(node_id, "proximity_alert", cls,
+    /* Written onto the snapshot node_state_t the caller holds — persisted
+     * back into the real g_nodes[] entry once the caller re-locks
+     * g_nodes_lock, same pattern already used for proximity_alert. */
+    snprintf(n->ai_classification, sizeof(n->ai_classification), "%s", cls);
+
+    push_alert(n->node_id, "proximity_alert", cls,
                "Perimeter breach detected — distance %.1fcm, movement classified as %s",
-               distance_cm, cls);
+               n->distance_cm, cls);
 
     free(classification);
 }
@@ -807,8 +714,7 @@ static void check_thresholds_and_alert(node_state_t *n) {
     if (n->has_distance) {
         n->proximity_alert = (n->distance_cm < PROXIMITY_THRESHOLD_CM);
         if (n->proximity_alert) {
-            trigger_radar_classification(n->node_id, n->distance_cm,
-                                          n->distance_history, n->distance_history_count);
+            trigger_radar_classification(n);
         }
     }
 }
@@ -955,7 +861,10 @@ static void handle_post_sensor_data(int fd, const http_request_t *req) {
 
     pthread_mutex_lock(&g_nodes_lock);
     n = find_or_create_node_locked(node_id);
-    if (n) n->proximity_alert = snapshot.proximity_alert;
+    if (n) {
+        n->proximity_alert = snapshot.proximity_alert;
+        snprintf(n->ai_classification, sizeof(n->ai_classification), "%s", snapshot.ai_classification);
+    }
     pthread_mutex_unlock(&g_nodes_lock);
 
     http_send_json(fd, 200, "OK", "{\"status\":\"ok\"}");
@@ -1044,18 +953,47 @@ static void handle_get_nodes(int fd) {
                        r->node_id, NODE_OFFLINE_SEC);
         }
 
+        /* distance_history / ai_classification live only in memory
+         * (g_nodes[], fed by push_distance_history_locked() and
+         * trigger_radar_classification()) — not in SQLite, so look the
+         * node up here instead of adding array columns to sensor_data. */
+        double hist[DISTANCE_HISTORY_LEN];
+        int hist_count = 0;
+        char ai_class[32] = "";
+
+        pthread_mutex_lock(&g_nodes_lock);
+        node_state_t *live = find_or_create_node_locked(r->node_id);
+        if (live) {
+            hist_count = live->distance_history_count;
+            memcpy(hist, live->distance_history, sizeof(hist));
+            snprintf(ai_class, sizeof(ai_class), "%s", live->ai_classification);
+        }
+        pthread_mutex_unlock(&g_nodes_lock);
+
+        char hist_json[160];
+        size_t hoff = 0;
+        hoff += (size_t)snprintf(hist_json + hoff, sizeof(hist_json) - hoff, "[");
+        for (int h = 0; h < hist_count && hoff < sizeof(hist_json); h++) {
+            hoff += (size_t)snprintf(hist_json + hoff, sizeof(hist_json) - hoff,
+                                      "%s%.1f", h > 0 ? "," : "", hist[h]);
+        }
+        hoff += (size_t)snprintf(hist_json + hoff, sizeof(hist_json) - hoff, "]");
+
         if (i > 0) off += (size_t)snprintf(json + off, sizeof(json) - off, ",");
         off += (size_t)snprintf(json + off, sizeof(json) - off,
             "{\"node_id\":\"%s\",\"location\":\"%s\",\"lat\":%.4f,\"lon\":%.4f,"
             "\"temperature_c\":%.1f,\"humidity_pct\":%.1f,\"distance_cm\":%.1f,"
-            "\"proximity_alert\":%s,\"online\":%s,\"last_seen\":%ld}",
+            "\"proximity_alert\":%s,\"online\":%s,\"last_seen\":%ld,"
+            "\"distance_history\":%s,\"ai_classification\":\"%s\"}",
             r->node_id, loc_display, lat, lon,
             r->has_temp ? r->temperature : 0.0,
             r->has_temp ? r->humidity : 0.0,
             r->has_dist ? r->distance : 0.0,
             (r->has_dist && r->proximity_alert) ? "true" : "false",
             online ? "true" : "false",
-            (long)r->last_seen);
+            (long)r->last_seen,
+            hist_json,
+            ai_class);
 
         if (off > sizeof(json) - 256) break;
     }
@@ -1284,43 +1222,6 @@ static void run_http_server(void) {
     }
 }
 
-/* Polls HC-SR04 every GPIO_POLL_INTERVAL_MS, checks thresholds, persists readings. */
-static void *gpio_poll_thread(void *arg) {
-    (void)arg;
-    LOG_INFO("HC-SR04 polling thread started (interval=%dms, sim=%s)",
-              GPIO_POLL_INTERVAL_MS, g_gpio_sim ? "yes" : "no");
-
-    while (!g_shutdown) {
-        double distance = gpio_read_distance_cm();
-        if (distance >= 0) {
-            pthread_mutex_lock(&g_nodes_lock);
-            node_state_t *n = find_or_create_node_locked("node_1");
-            node_state_t snapshot;
-            if (n) {
-                n->distance_cm = distance;
-                n->has_distance = 1;
-                n->last_seen = time(NULL);
-                push_distance_history_locked(n, distance);
-                snapshot = *n;
-            }
-            pthread_mutex_unlock(&g_nodes_lock);
-
-            if (n) {
-                check_thresholds_and_alert(&snapshot);
-                db_write_sensor_reading(&snapshot);
-
-                pthread_mutex_lock(&g_nodes_lock);
-                node_state_t *n2 = find_or_create_node_locked("node_1");
-                if (n2) n2->proximity_alert = snapshot.proximity_alert;
-                pthread_mutex_unlock(&g_nodes_lock);
-            }
-        }
-
-        usleep(GPIO_POLL_INTERVAL_MS * 1000);
-    }
-    return NULL;
-}
-
 /* SIGINT/SIGTERM handler: signals shutdown and unblocks accept(). */
 static void handle_sigint(int sig) {
     (void)sig;
@@ -1328,7 +1229,7 @@ static void handle_sigint(int sig) {
     if (g_listen_fd >= 0) close(g_listen_fd);
 }
 
-/* Loads config from env vars and initializes GPIO. */
+/* Loads config from env vars. */
 static void load_config(void) {
     const char *v;
 
@@ -1346,17 +1247,6 @@ static void load_config(void) {
 
     v = getenv("SENTINEL_RADAR_CMD");
     snprintf(g_radar_cmd, sizeof(g_radar_cmd), "%s", v ? v : DEFAULT_RADAR_CMD);
-
-    v = getenv("SENTINEL_GPIO_SIM");
-    g_gpio_sim = v ? atoi(v) : 0;
-
-    if (!g_gpio_sim) {
-        if (gpio_hw_init() != 0) {
-            LOG_WARN("Real GPIO init failed — forcing simulation mode so the "
-                      "rest of the pipeline still runs.");
-            g_gpio_sim = 1;
-        }
-    }
 }
 
 int main(void) {
@@ -1371,15 +1261,8 @@ int main(void) {
         return 1;
     }
 
-    LOG_INFO("Sentinel hub starting — HTTP :%d, DB %s, GPIO sim=%s",
-              g_http_port, g_db_path, g_gpio_sim ? "on" : "off");
-
-    pthread_t gpio_tid;
-    if (pthread_create(&gpio_tid, NULL, gpio_poll_thread, NULL) != 0) {
-        LOG_ERR("Failed to start GPIO polling thread: %s", strerror(errno));
-        return 1;
-    }
-    pthread_detach(gpio_tid);
+    LOG_INFO("Sentinel hub starting — HTTP :%d, DB %s — HC-SR04 arrives via ESP32 POST, no local GPIO polling",
+              g_http_port, g_db_path);
 
     pthread_t led_tid;
     if (pthread_create(&led_tid, NULL, led_poll_thread, NULL) != 0) {
@@ -1390,7 +1273,6 @@ int main(void) {
 
     run_http_server();
 
-    gpio_hw_cleanup();
     db_close();
     LOG_INFO("Shutting down.");
     return 0;
