@@ -1,7 +1,7 @@
 # 🛰️ Sentinel
 ### Edge AI-powered Arctic sensor network that never goes offline.
 
-![Dashboard Demo](assets/dashboard-demo.png)
+![Dashboard Demo](assets/dashboard-demo.jpeg)
 
 Built at **cuHacking 2026** · [marybits/sentinel](https://github.com/marybits/sentinel)
 
@@ -12,6 +12,7 @@ Built at **cuHacking 2026** · [marybits/sentinel](https://github.com/marybits/s
 Canada's Arctic covers 4 million square kilometers and includes over 220 remote communities living with **zero reliable internet infrastructure**. The Canadian Rangers patrol these regions blind: they have no means to monitor the environment, detect perimeter threats, or receive alerts when equipment fails.
 
 Traditional monitoring systems are built on a fragile paradigm: they stop working the moment connectivity drops. In the Arctic, that means they are effectively offline, always.
+
 ---
 
 ## 🛡️ The Solution
@@ -100,4 +101,4 @@ cd dashboard && npm install && npm run dev
 
 ---
 
-*Built in 36 hours by Mary Araujo & Julia · cuHacking 2026*
+*Built in 36 hours by Mary Araujo & Julia Reza · cuHacking 2026*
