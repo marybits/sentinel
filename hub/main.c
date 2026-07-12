@@ -4,9 +4,9 @@
  * QNX 8.0 base station for the Sentinel Arctic sensor network (cuHacking).
  * Receives ESP32 DHT11+HC-SR04 readings over HTTP (POST /sensor-data),
  * classifies the last 10 distance readings with a tiny on-device ML model
- * (radar_model.tflite via infer_radar.py) on proximity alerts, drives a
- * WS2812B LED strip as a physical alert indicator, persists everything to
- * SQLite, and serves GET /nodes, GET /alerts, and GET /history for Flask.
+ * (radar_model.tflite via infer_radar.py) on proximity alerts, persists
+ * everything to SQLite, and serves GET /nodes, GET /alerts, and GET
+ * /history for Flask.
  *
  * PLAN B PIVOT: the HC-SR04 used to be wired directly to this Pi's GPIO
  * (TRIG=23/ECHO=24), polled in a dedicated thread. QNX's VFS latency made
@@ -21,6 +21,14 @@
  * MLP that classifies the pattern behind a proximity breach (static/noise,
  * direct approach, or passing by) instead of a visual classification.
  *
+ * No physical LED indicator either — a WS2812B strip was wired to
+ * DIN=/dev/gpio18 for a bit-banged alert light, but bit-banging WS2812B's
+ * ~400ns-scale bit timing through a QNX resource-manager device file
+ * (write() -> IPC round trip per pin toggle) can't hit the required
+ * precision; the chip never latched valid data. Removed rather than sunk
+ * more hackathon time into it — alert state is fully visible in the
+ * dashboard (RadarTelemetry.jsx's HUD + AlertFeed) without it.
+ *
  * Build:  clang -Wall -Wextra -O2 -std=c11 -o hub main.c -lpthread -lsqlite3
  *         (see hub/Makefile)
  * Run:    ./hub
@@ -30,10 +38,6 @@
  *   SENTINEL_DB_PATH     SQLite DB path            (default $HOME/sentinel/sentinel.db)
  *   SENTINEL_RADAR_CMD   movement classifier cmd   (default ./infer_radar.py,
  *                          see hub/infer_radar.py + ml/train_synthetic_model.py)
- *
- * GPIO note: the only physical GPIO left on this Pi is the WS2812B LED
- * (DIN on /dev/gpio18) — best-effort bit-bang over gpio_pin_write(), see
- * the comment above led_send_bit() for its limitations.
  */
 
 #include <stdio.h>
@@ -47,7 +51,6 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <stdarg.h>
-#include <fcntl.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -447,170 +450,38 @@ static void db_write_alert(const alert_t *a) {
     pthread_mutex_unlock(&g_db_lock);
 }
 
-#define GPIO_DEV_PATH_FMT       "/dev/gpio/%d"
-#define LED_DATA_PIN             18   /* WS2812B DIN, per hardware plan (Pi Pin 12) */
-
-#define LED_COUNT                8     /* WS2812B stick, 8 pixels */
-#define LED_POLL_INTERVAL_MS     150   /* tick rate for pulse/flash animation */
-#define LED_BRIGHTNESS_DIM       40    /* out of 255 — plenty visible, easy on a shared USB rail */
-
-static int g_led_fd = -1;
-
-/* Opens /dev/gpio<pin>. Only used for the LED now — the HC-SR04 moved to
- * the ESP32 in the Plan B pivot, no more TRIG/ECHO pins on this Pi. */
-static int gpio_pin_open(int pin, int flags) {
-    char path[32];
-    snprintf(path, sizeof(path), GPIO_DEV_PATH_FMT, pin);
-    int fd = open(path, flags);
-    if (fd < 0) {
-        LOG_ERR("gpio_pin_open: open(%s) failed: %s", path, strerror(errno));
-    }
-    return fd;
-}
-
-/* Drives an output pin to 0/1 (ASCII, falling back to a raw byte). */
-static int gpio_pin_write(int fd, int value) {
-    char ascii = value ? '1' : '0';
-    if (write(fd, &ascii, 1) == 1) return 0;
-
-    char raw = (char)(value ? 1 : 0);
-    if (write(fd, &raw, 1) == 1) return 0;
-
-    return -1;
-}
-
-/* ----------------------------------------------------------------
- * WS2812B LED strip — physical alert indicator on LED_DATA_PIN.
- *
- * Bit-banged over gpio_pin_write() above: nanosleep() between writes to
- * approximate the WS2812B protocol's ~1.25us/bit timing (T0H 400ns/T0L
- * 850ns for a 0, T1H 800ns/T1L 450ns for a 1, GRB byte order, latched by
- * a >=50us low "reset" pulse). Userspace nanosleep can't guarantee
- * sub-microsecond precision, so on marginal hardware individual pixels
- * may glitch — this is a known limitation of driving WS2812B without
- * PWM+DMA, not a bug. If the pin can't be opened at all (hardware not
- * present), we fall back to logging state transitions only.
- * ---------------------------------------------------------------- */
-
-typedef enum { LED_STATE_GREEN, LED_STATE_YELLOW, LED_STATE_RED } led_state_t;
-
-/* Sends a single WS2812B bit. */
-static void led_send_bit(int fd, int bit) {
-    struct timespec high, low;
-    if (bit) {
-        high = (struct timespec){ .tv_sec = 0, .tv_nsec = 800 };
-        low  = (struct timespec){ .tv_sec = 0, .tv_nsec = 450 };
-    } else {
-        high = (struct timespec){ .tv_sec = 0, .tv_nsec = 400 };
-        low  = (struct timespec){ .tv_sec = 0, .tv_nsec = 850 };
-    }
-    gpio_pin_write(fd, 1);
-    nanosleep(&high, NULL);
-    gpio_pin_write(fd, 0);
-    nanosleep(&low, NULL);
-}
-
-/* Sends one byte MSB-first. */
-static void led_send_byte(int fd, unsigned char b) {
-    for (int i = 7; i >= 0; i--) {
-        led_send_bit(fd, (b >> i) & 1);
-    }
-}
-
-/* Sends LED_COUNT pixels of the same RGB color, then latches with a reset pulse. */
-static void led_show(int fd, unsigned char r, unsigned char g, unsigned char b) {
-    if (fd < 0) return; /* simulated — nothing to drive */
-    for (int i = 0; i < LED_COUNT; i++) {
-        led_send_byte(fd, g); /* WS2812B wants GRB order, not RGB */
-        led_send_byte(fd, r);
-        led_send_byte(fd, b);
-    }
-    struct timespec reset = { .tv_sec = 0, .tv_nsec = 60000 }; /* >=50us low = latch */
-    nanosleep(&reset, NULL);
-}
-
-/* Opens the LED data pin. Returns -1 (simulated mode) on failure — never fatal. */
-static int led_hw_init(void) {
-    int fd = gpio_pin_open(LED_DATA_PIN, O_WRONLY);
-    if (fd < 0) {
-        LOG_WARN("LED strip init failed — running in simulated mode (state changes logged only)");
-        return -1;
-    }
-    gpio_pin_write(fd, 0);
-    LOG_INFO("WS2812B LED strip initialized: DIN=/dev/gpio%d (fd=%d), %d pixels",
-              LED_DATA_PIN, fd, LED_COUNT);
-    return fd;
-}
-
-static void led_hw_cleanup(int fd) {
-    if (fd >= 0) {
-        led_show(fd, 0, 0, 0); /* off on shutdown */
-        close(fd);
-    }
-}
-
-/* Aggregates every known node's current snapshot into one LED state.
- * Mirrors classify_status()/check_thresholds_and_alert()'s thresholds so
- * the physical LED never disagrees with what triggered an alert. */
-static led_state_t compute_led_state(void) {
-    led_state_t worst = LED_STATE_GREEN;
-    time_t now = time(NULL);
-
-    pthread_mutex_lock(&g_nodes_lock);
-    for (int i = 0; i < MAX_NODES; i++) {
-        node_state_t *n = &g_nodes[i];
-        if (!n->in_use) continue;
-
-        int offline = (now - n->last_seen) >= NODE_OFFLINE_SEC;
-        int critical = offline ||
-                       (n->has_distance && n->proximity_alert) ||
-                       (n->has_temperature && (n->temperature_c > TEMP_HIGH_C || n->temperature_c < TEMP_LOW_C));
-        int warning = !critical && n->has_temperature && n->humidity_pct > HUMIDITY_HIGH_PCT;
-
-        if (critical) { worst = LED_STATE_RED; break; }
-        if (warning && worst == LED_STATE_GREEN) worst = LED_STATE_YELLOW;
-    }
-    pthread_mutex_unlock(&g_nodes_lock);
-
-    return worst;
-}
-
-/* Drives the LED strip: solid dim green when clear, pulsing amber on a
- * warning, flashing red on a critical alert. Runs until g_shutdown. */
-static void *led_poll_thread(void *arg) {
-    (void)arg;
-    int fd = led_hw_init();
-    led_state_t last_logged = LED_STATE_GREEN;
-    int tick_on = 1;
-
-    LOG_INFO("LED polling thread started (interval=%dms)", LED_POLL_INTERVAL_MS);
-
-    while (!g_shutdown) {
-        led_state_t state = compute_led_state();
-        if (state != last_logged) {
-            static const char *names[] = { "GREEN", "YELLOW", "RED" };
-            LOG_INFO("LED state -> %s", names[state]);
-            last_logged = state;
+/* Escapes '"', '\\', and control chars for safe embedding inside a JSON
+ * string literal. Truncates rather than overflows dst. This matters
+ * because several fields written into our hand-rolled JSON below aren't
+ * fully within our control — location/node_id come from the ESP32's POST
+ * body, and ai_classification comes straight from infer_radar.py's stdout
+ * — an unescaped quote, backslash, or newline in any of them would
+ * corrupt the whole response and take down every GET /nodes, /alerts, or
+ * /history poll on the dashboard at once. */
+static void json_escape(const char *src, char *dst, size_t dst_sz) {
+    size_t o = 0;
+    if (dst_sz == 0) return;
+    for (const unsigned char *p = (const unsigned char *)src; *p && o + 1 < dst_sz; p++) {
+        if (*p == '"' || *p == '\\') {
+            if (o + 2 >= dst_sz) break;
+            dst[o++] = '\\';
+            dst[o++] = (char)*p;
+        } else if (*p == '\n') {
+            if (o + 2 >= dst_sz) break;
+            dst[o++] = '\\'; dst[o++] = 'n';
+        } else if (*p == '\r') {
+            if (o + 2 >= dst_sz) break;
+            dst[o++] = '\\'; dst[o++] = 'r';
+        } else if (*p == '\t') {
+            if (o + 2 >= dst_sz) break;
+            dst[o++] = '\\'; dst[o++] = 't';
+        } else if (*p < 0x20) {
+            continue; /* drop other control chars rather than escape \u00XX */
+        } else {
+            dst[o++] = (char)*p;
         }
-
-        switch (state) {
-            case LED_STATE_GREEN:
-                led_show(fd, 0, LED_BRIGHTNESS_DIM, 0);
-                break;
-            case LED_STATE_YELLOW: /* slow pulse */
-                led_show(fd, tick_on ? LED_BRIGHTNESS_DIM : 0, tick_on ? (LED_BRIGHTNESS_DIM * 3 / 4) : 0, 0);
-                break;
-            case LED_STATE_RED: /* fast flash */
-                led_show(fd, tick_on ? LED_BRIGHTNESS_DIM : 0, 0, 0);
-                break;
-        }
-        tick_on = !tick_on;
-
-        usleep(LED_POLL_INTERVAL_MS * 1000);
     }
-
-    led_hw_cleanup(fd);
-    return NULL;
+    dst[o] = '\0';
 }
 
 /* Runs an external classifier command with a timeout, returns malloc'd
@@ -979,13 +850,18 @@ static void handle_get_nodes(int fd) {
         }
         hoff += (size_t)snprintf(hist_json + hoff, sizeof(hist_json) - hoff, "]");
 
+        char node_id_esc[64], loc_esc[96], ai_class_esc[64];
+        json_escape(r->node_id, node_id_esc, sizeof(node_id_esc));
+        json_escape(loc_display, loc_esc, sizeof(loc_esc));
+        json_escape(ai_class, ai_class_esc, sizeof(ai_class_esc));
+
         if (i > 0) off += (size_t)snprintf(json + off, sizeof(json) - off, ",");
         off += (size_t)snprintf(json + off, sizeof(json) - off,
             "{\"node_id\":\"%s\",\"location\":\"%s\",\"lat\":%.4f,\"lon\":%.4f,"
             "\"temperature_c\":%.1f,\"humidity_pct\":%.1f,\"distance_cm\":%.1f,"
             "\"proximity_alert\":%s,\"online\":%s,\"last_seen\":%ld,"
             "\"distance_history\":%s,\"ai_classification\":\"%s\"}",
-            r->node_id, loc_display, lat, lon,
+            node_id_esc, loc_esc, lat, lon,
             r->has_temp ? r->temperature : 0.0,
             r->has_temp ? r->humidity : 0.0,
             r->has_dist ? r->distance : 0.0,
@@ -993,7 +869,7 @@ static void handle_get_nodes(int fd) {
             online ? "true" : "false",
             (long)r->last_seen,
             hist_json,
-            ai_class);
+            ai_class_esc);
 
         if (off > sizeof(json) - 256) break;
     }
@@ -1032,16 +908,19 @@ static void handle_get_alerts(int fd) {
         const unsigned char *classification = sqlite3_column_text(stmt, 4);
         sqlite3_int64 ts = sqlite3_column_int64(stmt, 5);
 
+        char node_id_esc[64], type_esc[64], message_esc[320], class_esc[32];
+        json_escape(node_id ? (const char *)node_id : "", node_id_esc, sizeof(node_id_esc));
+        json_escape(type ? (const char *)type : "", type_esc, sizeof(type_esc));
+        json_escape(message ? (const char *)message : "", message_esc, sizeof(message_esc));
+        json_escape(classification ? (const char *)classification : "", class_esc, sizeof(class_esc));
+
         if (!first) off += (size_t)snprintf(json + off, sizeof(json) - off, ",");
         first = 0;
         off += (size_t)snprintf(json + off, sizeof(json) - off,
             "{\"id\":%lld,\"node_id\":\"%s\",\"type\":\"%s\",\"message\":\"%s\","
             "\"classification\":\"%s\",\"timestamp\":%lld}",
             (long long)id,
-            node_id ? (const char *)node_id : "",
-            type ? (const char *)type : "",
-            message ? (const char *)message : "",
-            classification ? (const char *)classification : "",
+            node_id_esc, type_esc, message_esc, class_esc,
             (long long)ts);
 
         if (off > sizeof(json) - 512) break;
@@ -1122,12 +1001,16 @@ static void handle_get_history(int fd, const http_request_t *req) {
     off += (size_t)snprintf(json + off, sizeof(json) - off, "[");
     for (int i = row_count - 1; i >= 0; i--) {
         history_row_t *r = &rows[i];
+        char node_id_esc[64], loc_esc[96];
+        json_escape(r->node_id, node_id_esc, sizeof(node_id_esc));
+        json_escape(r->location, loc_esc, sizeof(loc_esc));
+
         if (i != row_count - 1) off += (size_t)snprintf(json + off, sizeof(json) - off, ",");
         off += (size_t)snprintf(json + off, sizeof(json) - off,
             "{\"node_id\":\"%s\",\"location\":\"%s\","
             "\"temperature\":%.1f,\"humidity\":%.1f,\"distance_cm\":%.1f,"
             "\"proximity_alert\":%s,\"timestamp\":%ld}",
-            r->node_id, r->location,
+            node_id_esc, loc_esc,
             r->has_temp ? r->temperature : 0.0,
             r->has_temp ? r->humidity : 0.0,
             r->has_dist ? r->distance : 0.0,
@@ -1263,13 +1146,6 @@ int main(void) {
 
     LOG_INFO("Sentinel hub starting — HTTP :%d, DB %s — HC-SR04 arrives via ESP32 POST, no local GPIO polling",
               g_http_port, g_db_path);
-
-    pthread_t led_tid;
-    if (pthread_create(&led_tid, NULL, led_poll_thread, NULL) != 0) {
-        LOG_ERR("Failed to start LED polling thread: %s — continuing without physical alerts", strerror(errno));
-    } else {
-        pthread_detach(led_tid);
-    }
 
     run_http_server();
 
