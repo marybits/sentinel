@@ -11,35 +11,34 @@
 # If clang complains about missing socket symbols, try uncommenting
 # LDFLAGS_SOCKET below (some QNX images split networking into libsocket).
 #
-# capture_snapshot is a SEPARATE binary (see capture_snapshot.c) that
-# hub shells out to via system() right before running the OpenCV
-# classifier — it needs -lcamera, which `hub` itself does not link.
-# Field names inside capture_snapshot.c are best-effort against the real
-# QNX camera_api — check the header comment there before trusting `make`
-# to succeed on the first try.
+# Movement classification (proximity_alert) shells out to infer_radar.py
+# (see infer_radar.py + ../ml/train_synthetic_model.py) via popen() — it's
+# plain Python using tflite_runtime, nothing to compile here, but `hub`
+# needs radar_model.tflite present in this directory at runtime (copy it
+# from wherever train_synthetic_model.py wrote it) or every proximity
+# alert will classify as "unknown".
+#
+# capture_snapshot.c / opencv_classify.py are LEFTOVER from an earlier
+# camera-based pivot and are no longer built or invoked by hub — safe to
+# delete once you're sure you don't need them.
 
 CC      = clang
 CFLAGS  = -Wall -Wextra -O2 -std=c11 -D_POSIX_C_SOURCE=200809L
 LDFLAGS = -lpthread -lsqlite3
-CAMERA_LDFLAGS = -lcamera
 # LDFLAGS_SOCKET = -lsocket
 # LDFLAGS += $(LDFLAGS_SOCKET)
 
 BIN = hub
-SNAPSHOT_BIN = capture_snapshot
 
-all: $(BIN) $(SNAPSHOT_BIN)
+all: $(BIN)
 
 $(BIN): main.c
 	$(CC) $(CFLAGS) -o $(BIN) main.c $(LDFLAGS)
-
-$(SNAPSHOT_BIN): capture_snapshot.c
-	$(CC) $(CFLAGS) -o $(SNAPSHOT_BIN) capture_snapshot.c $(CAMERA_LDFLAGS)
 
 run: $(BIN)
 	./$(BIN)
 
 clean:
-	rm -f $(BIN) $(SNAPSHOT_BIN)
+	rm -f $(BIN)
 
 .PHONY: all run clean

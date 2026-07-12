@@ -3,9 +3,17 @@
  *
  * QNX 8.0 base station for the Sentinel Arctic sensor network (cuHacking).
  * Receives ESP32/DHT11 readings over HTTP, polls an HC-SR04 over GPIO,
- * triggers the camera + an OpenCV classifier on proximity alerts, drives a
+ * classifies the last 10 distance readings with a tiny on-device ML model
+ * (radar_model.tflite via infer_radar.py) on proximity alerts, drives a
  * WS2812B LED strip as a physical alert indicator, persists everything to
  * SQLite, and serves GET /nodes, GET /alerts, and GET /history for Flask.
+ *
+ * No camera/OpenCV involved — an earlier pivot used the Pi Camera +
+ * OpenCV for intruder classification, but we're on ultrasonic-only now:
+ * the HC-SR04's last 10 readings (2s of pings, one every 500ms — see
+ * GPIO_POLL_INTERVAL_MS) get fed to a small MLP that classifies the
+ * movement pattern behind a proximity breach (static/noise, direct
+ * approach, or passing by) instead of a visual classification.
  *
  * Build:  clang -Wall -Wextra -O2 -std=c11 -o hub main.c -lpthread -lsqlite3
  *         (see hub/Makefile)
@@ -15,9 +23,8 @@
  *   SENTINEL_HTTP_PORT   HTTP port                (default 8080)
  *   SENTINEL_DB_PATH     SQLite DB path            (default $HOME/sentinel/sentinel.db)
  *   SENTINEL_GPIO_SIM    force simulated HC-SR04   (default 0, real GPIO)
- *   SENTINEL_OPENCV_CMD  camera classifier command (default ./opencv_classify.py)
- *   SENTINEL_SNAPSHOT_CMD single-frame capture cmd (default ./capture_snapshot,
- *                          see hub/capture_snapshot.c — run before the classifier)
+ *   SENTINEL_RADAR_CMD   movement classifier cmd   (default ./infer_radar.py,
+ *                          see hub/infer_radar.py + ml/train_synthetic_model.py)
  *
  * GPIO note: talks to HC-SR04 over /dev/gpio23 (TRIG) / /dev/gpio24 (ECHO)
  * using a best-effort read/write protocol (see gpio_pin_read/gpio_pin_write);
@@ -46,8 +53,7 @@
 #include <sqlite3.h>
 
 #define DEFAULT_HTTP_PORT        8080
-#define DEFAULT_OPENCV_CMD       "./opencv_classify.py"
-#define DEFAULT_SNAPSHOT_CMD     "./capture_snapshot" /* see hub/capture_snapshot.c */
+#define DEFAULT_RADAR_CMD        "./infer_radar.py" /* see hub/infer_radar.py */
 #define DEFAULT_DB_SUBPATH       "/sentinel/sentinel.db" /* appended to $HOME */
 
 #define MAX_NODES                8
@@ -60,15 +66,14 @@
 #define NODE_OFFLINE_SEC         10
 #define GPIO_POLL_INTERVAL_MS    500
 #define ALERT_COOLDOWN_SEC       15 /* min seconds between repeats of the same alert */
-#define CAMERA_TIMEOUT_SEC       5
+#define CLASSIFIER_TIMEOUT_SEC   5
 #define ALERTS_RESPONSE_LIMIT    20
 #define HISTORY_RESPONSE_LIMIT_DEFAULT 100
 #define HISTORY_RESPONSE_LIMIT_MAX     200
 
 static int   g_http_port      = DEFAULT_HTTP_PORT;
 static char  g_db_path[512];
-static char  g_opencv_cmd[256];
-static char  g_snapshot_cmd[256];
+static char  g_radar_cmd[256];
 static int   g_gpio_sim       = 1;
 
 static sqlite3          *g_db = NULL;
@@ -96,6 +101,8 @@ static void log_line(const char *level, const char *fmt, ...) {
 #define LOG_WARN(...)  log_line("WARN", __VA_ARGS__)
 #define LOG_ERR(...)   log_line("ERROR", __VA_ARGS__)
 
+#define DISTANCE_HISTORY_LEN 10 /* 2s of HC-SR04 pings at GPIO_POLL_INTERVAL_MS=500 */
+
 typedef struct {
     char   node_id[32];
     char   location[48];
@@ -103,6 +110,8 @@ typedef struct {
     double temperature_c;
     double humidity_pct;
     double distance_cm;
+    double distance_history[DISTANCE_HISTORY_LEN]; /* ring buffer, oldest first */
+    int    distance_history_count;                  /* < LEN until the buffer fills once */
     int    has_temperature;
     int    has_distance;
     int    proximity_alert;
@@ -148,6 +157,18 @@ static node_state_t *find_or_create_node_locked(const char *node_id) {
     seed_known_location(node_id, n->location, sizeof(n->location), &n->lat, &n->lon);
     n->in_use = 1;
     return n;
+}
+
+/* Pushes one new reading into the node's rolling distance window (oldest
+ * evicted once full). Caller holds g_nodes_lock. */
+static void push_distance_history_locked(node_state_t *n, double distance) {
+    if (n->distance_history_count < DISTANCE_HISTORY_LEN) {
+        n->distance_history[n->distance_history_count++] = distance;
+    } else {
+        memmove(n->distance_history, n->distance_history + 1,
+                (DISTANCE_HISTORY_LEN - 1) * sizeof(double));
+        n->distance_history[DISTANCE_HISTORY_LEN - 1] = distance;
+    }
 }
 
 typedef struct {
@@ -689,7 +710,10 @@ static void *led_poll_thread(void *arg) {
     return NULL;
 }
 
-/* Runs the OpenCV classifier command with a timeout, returns malloc'd stdout or NULL. */
+/* Runs an external classifier command with a timeout, returns malloc'd
+ * first-line stdout or NULL. Generic — used for the radar movement
+ * classifier below, but not tied to it (just a "run cmd, read one line
+ * back within timeout_sec" helper). */
 static char *run_classifier_with_timeout(const char *cmd, int timeout_sec) {
     FILE *fp = popen(cmd, "r");
     if (!fp) {
@@ -708,7 +732,7 @@ static char *run_classifier_with_timeout(const char *cmd, int timeout_sec) {
     if (sel > 0 && FD_ISSET(fd, &rfds)) {
         if (fgets(buf, sizeof(buf), fp) == NULL) buf[0] = '\0';
     } else {
-        LOG_WARN("OpenCV classifier timed out after %ds", timeout_sec);
+        LOG_WARN("classifier ('%s') timed out after %ds", cmd, timeout_sec);
     }
     pclose(fp);
 
@@ -721,27 +745,41 @@ static char *run_classifier_with_timeout(const char *cmd, int timeout_sec) {
     return result;
 }
 
-/* Runs the camera/OpenCV classifier and pushes a proximity alert with the result. */
-static void trigger_camera_and_classify(const char *node_id, double distance_cm) {
-    LOG_INFO("Perimeter breach on %s (%.1fcm) — triggering camera + OpenCV", node_id, distance_cm);
+/* Classifies the movement pattern behind a proximity breach using the
+ * node's last DISTANCE_HISTORY_LEN readings (~2s of pings) and pushes a
+ * proximity alert with the result. Shells out to infer_radar.py (a tiny
+ * tflite_runtime MLP trained by ml/train_synthetic_model.py) via
+ * run_classifier_with_timeout, passing the window as CLI args — no
+ * camera/OpenCV involved, this is ultrasonic-only. */
+static void trigger_radar_classification(const char *node_id, double distance_cm,
+                                          const double *history, int history_count) {
+    LOG_INFO("Perimeter breach on %s (%.1fcm) — classifying movement pattern", node_id, distance_cm);
 
-    /* Grab one fresh frame first (hub/capture_snapshot.c — a separate,
-     * standalone binary; does not touch this process's threads/state) so
-     * the classifier below has something current to read instead of a
-     * stale or missing /tmp/latest_snapshot.raw. Best-effort: a snapshot
-     * failure doesn't cancel the alert, just logs a warning — the
-     * classifier can still fall back to "unknown" same as a timeout. */
-    int snap_rc = system(g_snapshot_cmd);
-    if (snap_rc != 0) {
-        LOG_WARN("capture_snapshot ('%s') exited with code %d — classifying without a fresh frame",
-                  g_snapshot_cmd, snap_rc);
+    double window[DISTANCE_HISTORY_LEN];
+    if (history_count >= DISTANCE_HISTORY_LEN) {
+        memcpy(window, history, sizeof(window));
+    } else {
+        /* Buffer isn't full yet (e.g. right after startup) — pad the
+         * front by repeating the earliest sample so the model always
+         * gets a fixed DISTANCE_HISTORY_LEN-length window, same as what
+         * it was trained on. */
+        double pad = history_count > 0 ? history[0] : distance_cm;
+        int missing = DISTANCE_HISTORY_LEN - history_count;
+        for (int i = 0; i < missing; i++) window[i] = pad;
+        for (int i = 0; i < history_count; i++) window[missing + i] = history[i];
     }
 
-    char *classification = run_classifier_with_timeout(g_opencv_cmd, CAMERA_TIMEOUT_SEC);
+    char cmd[512];
+    size_t off = (size_t)snprintf(cmd, sizeof(cmd), "%s", g_radar_cmd);
+    for (int i = 0; i < DISTANCE_HISTORY_LEN && off < sizeof(cmd); i++) {
+        off += (size_t)snprintf(cmd + off, sizeof(cmd) - off, " %.1f", window[i]);
+    }
+
+    char *classification = run_classifier_with_timeout(cmd, CLASSIFIER_TIMEOUT_SEC);
     const char *cls = classification ? classification : "unknown";
 
     push_alert(node_id, "proximity_alert", cls,
-               "Perimeter breach detected — distance %.1fcm, classified as %s",
+               "Perimeter breach detected — distance %.1fcm, movement classified as %s",
                distance_cm, cls);
 
     free(classification);
@@ -769,7 +807,8 @@ static void check_thresholds_and_alert(node_state_t *n) {
     if (n->has_distance) {
         n->proximity_alert = (n->distance_cm < PROXIMITY_THRESHOLD_CM);
         if (n->proximity_alert) {
-            trigger_camera_and_classify(n->node_id, n->distance_cm);
+            trigger_radar_classification(n->node_id, n->distance_cm,
+                                          n->distance_history, n->distance_history_count);
         }
     }
 }
@@ -901,6 +940,7 @@ static void handle_post_sensor_data(int fd, const http_request_t *req) {
     if (has_dist) {
         n->distance_cm = distance;
         n->has_distance = 1;
+        push_distance_history_locked(n, distance);
     }
     n->last_seen = time(NULL);
 
@@ -1260,6 +1300,7 @@ static void *gpio_poll_thread(void *arg) {
                 n->distance_cm = distance;
                 n->has_distance = 1;
                 n->last_seen = time(NULL);
+                push_distance_history_locked(n, distance);
                 snapshot = *n;
             }
             pthread_mutex_unlock(&g_nodes_lock);
@@ -1303,11 +1344,8 @@ static void load_config(void) {
         snprintf(g_db_path, sizeof(g_db_path), "%s%s", home, DEFAULT_DB_SUBPATH);
     }
 
-    v = getenv("SENTINEL_OPENCV_CMD");
-    snprintf(g_opencv_cmd, sizeof(g_opencv_cmd), "%s", v ? v : DEFAULT_OPENCV_CMD);
-
-    v = getenv("SENTINEL_SNAPSHOT_CMD");
-    snprintf(g_snapshot_cmd, sizeof(g_snapshot_cmd), "%s", v ? v : DEFAULT_SNAPSHOT_CMD);
+    v = getenv("SENTINEL_RADAR_CMD");
+    snprintf(g_radar_cmd, sizeof(g_radar_cmd), "%s", v ? v : DEFAULT_RADAR_CMD);
 
     v = getenv("SENTINEL_GPIO_SIM");
     g_gpio_sim = v ? atoi(v) : 0;
