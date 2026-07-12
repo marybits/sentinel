@@ -51,6 +51,7 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
@@ -1180,6 +1181,13 @@ static void run_http_server(void) {
 
     int opt = 1;
     setsockopt(g_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    /* Without this, every radar_start_locked() fork() (the very first one
+     * at boot, and any later one restarting a dead/timed-out classifier)
+     * hands the listening socket to the Python child too — exec() doesn't
+     * close inherited fds on its own. It's a harmless-in-practice leak
+     * (infer_radar.py never touches it) but there's no reason to keep it
+     * around. */
+    fcntl(g_listen_fd, F_SETFD, FD_CLOEXEC);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -1209,6 +1217,10 @@ static void run_http_server(void) {
             LOG_WARN("accept() failed: %s", strerror(errno));
             continue;
         }
+        /* Same reasoning as the listening socket above — a classifier
+         * restart mid-request shouldn't hand a client's live connection
+         * fd to the Python child. */
+        fcntl(client_fd, F_SETFD, FD_CLOEXEC);
 
         pthread_t tid;
         if (pthread_create(&tid, NULL, handle_client_thread, (void *)(intptr_t)client_fd) != 0) {
