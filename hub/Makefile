@@ -11,12 +11,15 @@
 # If clang complains about missing socket symbols, try uncommenting
 # LDFLAGS_SOCKET below (some QNX images split networking into libsocket).
 #
-# Movement classification (proximity_alert) shells out to infer_radar.py
-# (see infer_radar.py + ../ml/train_synthetic_model.py) via popen() — it's
-# plain Python using tflite_runtime, nothing to compile here, but `hub`
-# needs radar_model.tflite present in this directory at runtime (copy it
-# from wherever train_synthetic_model.py wrote it) or every proximity
-# alert will classify as "unknown".
+# Movement classification (proximity_alert) talks to infer_radar.py (see
+# infer_radar.py + ../ml/train_synthetic_model.py) — plain Python using
+# tflite_runtime, nothing to compile here. `hub` forks+execs it ONCE at
+# startup in server mode (stdin/stdout pipes, model loaded once — see
+# radar_start_locked()/radar_classify() in main.c) instead of spawning a
+# fresh process per breach. Either way, `hub` needs radar_model.tflite
+# present in this directory at runtime (copy it from wherever
+# train_synthetic_model.py wrote it) or every proximity alert will
+# classify as "unknown".
 #
 # capture_snapshot.c / opencv_classify.py are LEFTOVER from an earlier
 # camera-based pivot and are no longer built or invoked by hub — safe to

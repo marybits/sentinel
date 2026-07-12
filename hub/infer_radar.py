@@ -11,21 +11,45 @@ Model: radar_model.tflite, trained on your laptop by
 ../ml/train_synthetic_model.py and copied into this directory (hub/).
 Class order MUST match training: 0=static, 1=approaching, 2=passing.
 
-Invocation (hub/main.c calls this via popen(), same pattern the old
-opencv_classify.py used — see trigger_radar_classification()):
+Two modes:
 
-    ./infer_radar.py <d0> <d1> ... <d9>
+  SERVER MODE (default — no args). hub/main.c forks+execs this ONCE at
+  startup (see radar_start_locked() in main.c) and keeps its stdin/stdout
+  pipes open for the life of the hub process, instead of popen()'ing a
+  fresh interpreter on every single proximity breach — loading the model
+  and standing up the XNNPACK delegate is the slow part, so paying that
+  cost once instead of per-breach is the whole point. Reads one line of
+  JSON per request from stdin, e.g.:
 
-10 positional args, oldest reading first, raw centimeters, no scaling.
-Prints exactly one line to stdout: the predicted label ("static",
-"approaching", "passing", or "unknown" on any failure) — nothing else on
-stdout, since hub/main.c's run_classifier_with_timeout() reads a single
-fgets() line. All diagnostics go to stderr instead.
+      [120.0, 115.0, 108.0, 95.0, 80.0, 60.0, 45.0, 30.0, 20.0, 12.0]
 
-Manual test:
+  and writes exactly one line back to stdout: the predicted label
+  ("static", "approaching", "passing", or "unknown" on any per-request
+  failure — a bad request doesn't crash the server, so hub doesn't need
+  to respawn it just because one line of input was malformed). All
+  diagnostics go to stderr, never stdout, since hub/main.c reads stdout
+  one fgets() line per request and a stray extra line would desync the
+  protocol.
+
+  ONE-SHOT MODE (CLI args, for manual testing only — hub/main.c no
+  longer uses this):
+
+      ./infer_radar.py <d0> <d1> ... <d9>
+
+  10 positional args, oldest reading first, raw centimeters, no scaling.
+  Prints one label to stdout and exits. Loads its own interpreter each
+  time, which is exactly the per-call cost server mode avoids.
+
+Manual test (one-shot):
     ./infer_radar.py 120.0 115.0 108.0 95.0 80.0 60.0 45.0 30.0 20.0 12.0
+
+Manual test (server mode):
+    ./infer_radar.py
+    [120.0, 115.0, 108.0, 95.0, 80.0, 60.0, 45.0, 30.0, 20.0, 12.0]
+    (type/paste a JSON array + Enter, get a label back, repeat, Ctrl+D to quit)
 """
 
+import json
 import os
 import sys
 
@@ -79,9 +103,52 @@ def predict_movement(distance_array, interpreter=None):
     return CLASS_LABELS[class_index]
 
 
+def serve():
+    """Server mode: loads the interpreter ONCE, then services one
+    classification per line of stdin (a JSON array of WINDOW_LEN floats),
+    writing the predicted label to stdout per line. Runs until stdin
+    closes (hub exiting, or hub killing this process to restart it — see
+    radar_stop_locked() in main.c). A bad request logs to stderr and
+    answers "unknown" rather than crashing the whole server, since one
+    malformed line shouldn't take down a process hub expects to stay up
+    for its entire run."""
+    try:
+        interpreter = load_interpreter()
+    except Exception as e:
+        # No model file, no tflite_runtime, etc — nothing to serve with.
+        # Exit non-zero so hub's radar_classify() sees the pipe close
+        # (read() -> EOF) on its very first request and logs accordingly,
+        # rather than hanging until CLASSIFIER_TIMEOUT_SEC every time.
+        print(f"infer_radar: failed to load interpreter, exiting: {e}", file=sys.stderr)
+        return 1
+
+    print("infer_radar: model loaded, ready for requests", file=sys.stderr)
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            distances = json.loads(line)
+            if not isinstance(distances, list):
+                raise ValueError("expected a JSON array of floats")
+            label = predict_movement([float(d) for d in distances], interpreter=interpreter)
+        except Exception as e:
+            print(f"infer_radar: request failed ({line!r}): {e}", file=sys.stderr)
+            label = "unknown"
+
+        print(label, flush=True)
+
+    return 0
+
+
 def main():
+    if len(sys.argv) == 1:
+        return serve()
+
     if len(sys.argv) != WINDOW_LEN + 1:
-        print(f"usage: {sys.argv[0]} <d0> <d1> ... <d9>  ({WINDOW_LEN} distances in cm)",
+        print(f"usage: {sys.argv[0]} <d0> <d1> ... <d9>  ({WINDOW_LEN} distances in cm)"
+              f"\n       {sys.argv[0]}  (no args -> server mode, see module docstring)",
               file=sys.stderr)
         print("unknown")
         return 1

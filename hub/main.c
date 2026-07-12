@@ -52,6 +52,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -66,7 +67,7 @@
 #define REQ_BUF_SIZE             8192
 
 #define PROXIMITY_THRESHOLD_CM   30.0
-#define TEMP_HIGH_C              35.0
+#define TEMP_HIGH_C              32.0
 #define TEMP_LOW_C               (-10.0)
 #define HUMIDITY_HIGH_PCT        80.0
 #define NODE_OFFLINE_SEC         10
@@ -484,47 +485,167 @@ static void json_escape(const char *src, char *dst, size_t dst_sz) {
     dst[o] = '\0';
 }
 
-/* Runs an external classifier command with a timeout, returns malloc'd
- * first-line stdout or NULL. Generic — used for the radar movement
- * classifier below, but not tied to it (just a "run cmd, read one line
- * back within timeout_sec" helper). */
-static char *run_classifier_with_timeout(const char *cmd, int timeout_sec) {
-    FILE *fp = popen(cmd, "r");
-    if (!fp) {
-        LOG_ERR("run_classifier_with_timeout: popen('%s') failed: %s", cmd, strerror(errno));
+/* ----------------------------------------------------------------
+ * Persistent radar classifier process.
+ *
+ * infer_radar.py used to be popen()'d fresh on every proximity breach —
+ * simple, but TFLite's interpreter/XNNPACK-delegate setup gets paid on
+ * every single call, which was the visible multi-hundred-ms delay
+ * between a breach and the alert/LED reacting. Now hub starts it ONCE
+ * at boot (server mode: no CLI args -> infer_radar.py loads the model
+ * once and services requests off stdin/stdout instead of exiting), and
+ * every breach just writes one line of JSON ("[d0,d1,...,d9]\n") to its
+ * stdin and reads one line of label back from its stdout — no process
+ * spawn, no model reload. g_radar_lock serializes access since HTTP
+ * requests are handled one thread per connection, but the classifier
+ * only understands one request at a time on its pipes.
+ * ---------------------------------------------------------------- */
+
+static pid_t            g_radar_pid   = -1;
+static int               g_radar_in_fd = -1;  /* hub writes distance arrays to the child's stdin here */
+static FILE             *g_radar_out   = NULL; /* hub reads classification labels from the child's stdout here */
+static pthread_mutex_t   g_radar_lock  = PTHREAD_MUTEX_INITIALIZER;
+
+/* Forks+execs g_radar_cmd via /bin/sh -c (same as the old popen() calls,
+ * so SENTINEL_RADAR_CMD keeps working unchanged) as a long-lived child,
+ * wiring its stdin/stdout to pipes hub keeps open across every
+ * classification. Caller must hold g_radar_lock. Returns 0 on success. */
+static int radar_start_locked(void) {
+    int in_pipe[2], out_pipe[2];
+    if (pipe(in_pipe) != 0) {
+        LOG_ERR("radar_start: pipe(stdin) failed: %s", strerror(errno));
+        return -1;
+    }
+    if (pipe(out_pipe) != 0) {
+        LOG_ERR("radar_start: pipe(stdout) failed: %s", strerror(errno));
+        close(in_pipe[0]); close(in_pipe[1]);
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        LOG_ERR("radar_start: fork() failed: %s", strerror(errno));
+        close(in_pipe[0]); close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* child: stdin <- in_pipe read end, stdout -> out_pipe write end */
+        dup2(in_pipe[0], STDIN_FILENO);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        close(in_pipe[0]); close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        execl("/bin/sh", "sh", "-c", g_radar_cmd, (char *)NULL);
+        _exit(127); /* only reached if execl itself failed */
+    }
+
+    /* parent */
+    close(in_pipe[0]);
+    close(out_pipe[1]);
+    g_radar_out = fdopen(out_pipe[0], "r");
+    if (!g_radar_out) {
+        LOG_ERR("radar_start: fdopen failed: %s", strerror(errno));
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        return -1;
+    }
+    g_radar_pid = pid;
+    g_radar_in_fd = in_pipe[1];
+    LOG_INFO("radar classifier started (pid=%d, cmd='%s')", (int)pid, g_radar_cmd);
+    return 0;
+}
+
+/* Kills and reaps the classifier child, closing both pipe ends. Caller
+ * must hold g_radar_lock. Safe to call when nothing is running. */
+static void radar_stop_locked(void) {
+    if (g_radar_in_fd >= 0) { close(g_radar_in_fd); g_radar_in_fd = -1; }
+    if (g_radar_out) { fclose(g_radar_out); g_radar_out = NULL; } /* also closes out_pipe read end */
+    if (g_radar_pid > 0) {
+        kill(g_radar_pid, SIGTERM);
+        waitpid(g_radar_pid, NULL, 0);
+        g_radar_pid = -1;
+    }
+}
+
+/* Starts the classifier at hub boot. Public (unlocked) entry point. */
+static void radar_start(void) {
+    pthread_mutex_lock(&g_radar_lock);
+    if (g_radar_pid < 0) radar_start_locked();
+    pthread_mutex_unlock(&g_radar_lock);
+}
+
+/* Stops the classifier at hub shutdown. Public (unlocked) entry point. */
+static void radar_stop(void) {
+    pthread_mutex_lock(&g_radar_lock);
+    radar_stop_locked();
+    pthread_mutex_unlock(&g_radar_lock);
+}
+
+/* Sends one classification request to the persistent classifier and
+ * returns its malloc'd answer, or NULL on timeout/failure. Restarts the
+ * child automatically if it isn't running yet, or turns out to be dead
+ * (write fails, or the read times out/hits EOF — a crash, an unhandled
+ * exception past infer_radar.py's own try/except, or QNX reclaiming it
+ * under memory pressure would all look like this from here). */
+static char *radar_classify(const double *window, int window_len, int timeout_sec) {
+    pthread_mutex_lock(&g_radar_lock);
+
+    if (g_radar_pid < 0 && radar_start_locked() != 0) {
+        pthread_mutex_unlock(&g_radar_lock);
         return NULL;
     }
 
-    int fd = fileno(fp);
-    fd_set rfds;
-    struct timeval tv = { .tv_sec = timeout_sec, .tv_usec = 0 };
-    FD_ZERO(&rfds);
-    FD_SET(fd, &rfds);
-
-    char buf[128] = {0};
-    int sel = select(fd + 1, &rfds, NULL, NULL, &tv);
-    if (sel > 0 && FD_ISSET(fd, &rfds)) {
-        if (fgets(buf, sizeof(buf), fp) == NULL) buf[0] = '\0';
-    } else {
-        LOG_WARN("classifier ('%s') timed out after %ds", cmd, timeout_sec);
+    char line[256];
+    size_t off = (size_t)snprintf(line, sizeof(line), "[");
+    for (int i = 0; i < window_len && off < sizeof(line); i++) {
+        off += (size_t)snprintf(line + off, sizeof(line) - off, "%s%.2f", i > 0 ? "," : "", window[i]);
     }
-    pclose(fp);
+    off += (size_t)snprintf(line + off, sizeof(line) - off, "]\n");
 
-    size_t len = strlen(buf);
-    while (len > 0 && isspace((unsigned char)buf[len - 1])) buf[--len] = '\0';
-    if (len == 0) return NULL;
+    int wrote_ok = (write(g_radar_in_fd, line, off) == (ssize_t)off);
+    if (!wrote_ok) {
+        LOG_WARN("radar_classify: write to classifier pipe failed (%s) — restarting classifier",
+                  strerror(errno));
+        radar_stop_locked();
+        wrote_ok = (radar_start_locked() == 0) && (write(g_radar_in_fd, line, off) == (ssize_t)off);
+    }
 
-    char *result = malloc(len + 1);
-    if (result) memcpy(result, buf, len + 1);
+    char *result = NULL;
+    if (wrote_ok) {
+        int out_fd = fileno(g_radar_out);
+        fd_set rfds;
+        struct timeval tv = { .tv_sec = timeout_sec, .tv_usec = 0 };
+        FD_ZERO(&rfds);
+        FD_SET(out_fd, &rfds);
+
+        char buf[128] = {0};
+        int sel = select(out_fd + 1, &rfds, NULL, NULL, &tv);
+        if (sel > 0 && FD_ISSET(out_fd, &rfds) && fgets(buf, sizeof(buf), g_radar_out) != NULL) {
+            size_t len = strlen(buf);
+            while (len > 0 && isspace((unsigned char)buf[len - 1])) buf[--len] = '\0';
+            if (len > 0) {
+                result = malloc(len + 1);
+                if (result) memcpy(result, buf, len + 1);
+            }
+        } else {
+            LOG_WARN("radar_classify: classifier timed out/died after %ds — restarting for next request",
+                      timeout_sec);
+            radar_stop_locked();
+        }
+    }
+
+    pthread_mutex_unlock(&g_radar_lock);
     return result;
 }
 
 /* Classifies the movement pattern behind a proximity breach using the
  * node's last DISTANCE_HISTORY_LEN readings (~10s of ESP32 POSTs) and
- * pushes a proximity alert with the result. Shells out to infer_radar.py
- * (a tiny tflite_runtime MLP trained by ml/train_synthetic_model.py) via
- * run_classifier_with_timeout, passing the window as CLI args — no
- * camera/OpenCV involved, this is ultrasonic-only. */
+ * pushes a proximity alert with the result. Talks to the persistent
+ * infer_radar.py process via radar_classify() above — no camera/OpenCV
+ * involved, this is ultrasonic-only. */
 static void trigger_radar_classification(node_state_t *n) {
     LOG_INFO("Perimeter breach on %s (%.1fcm) — classifying movement pattern", n->node_id, n->distance_cm);
 
@@ -542,13 +663,7 @@ static void trigger_radar_classification(node_state_t *n) {
         for (int i = 0; i < n->distance_history_count; i++) window[missing + i] = n->distance_history[i];
     }
 
-    char cmd[512];
-    size_t off = (size_t)snprintf(cmd, sizeof(cmd), "%s", g_radar_cmd);
-    for (int i = 0; i < DISTANCE_HISTORY_LEN && off < sizeof(cmd); i++) {
-        off += (size_t)snprintf(cmd + off, sizeof(cmd) - off, " %.1f", window[i]);
-    }
-
-    char *classification = run_classifier_with_timeout(cmd, CLASSIFIER_TIMEOUT_SEC);
+    char *classification = radar_classify(window, DISTANCE_HISTORY_LEN, CLASSIFIER_TIMEOUT_SEC);
     const char *cls = classification ? classification : "unknown";
 
     /* Written onto the snapshot node_state_t the caller holds — persisted
@@ -1147,8 +1262,11 @@ int main(void) {
     LOG_INFO("Sentinel hub starting — HTTP :%d, DB %s — HC-SR04 arrives via ESP32 POST, no local GPIO polling",
               g_http_port, g_db_path);
 
+    radar_start(); /* boots the persistent infer_radar.py classifier once, see radar_classify() */
+
     run_http_server();
 
+    radar_stop();
     db_close();
     LOG_INFO("Shutting down.");
     return 0;

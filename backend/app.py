@@ -39,7 +39,7 @@ SQLITE_PATH = os.environ.get("SQLITE_PATH", "sentinel.db")  # lives next to app.
 # alert thresholds
 OFFLINE_THRESHOLD_SEC = 15  # no data for this long -> node marked offline
 SYNC_DISPLAY_SEC = 5        # how long GET /nodes keeps reporting is_syncing after a batch flush
-TEMP_ALERT_C = 20           # temp above this -> high-temp alert (overheating/fire risk)
+TEMP_ALERT_C = 32           # temp above this -> high-temp alert (overheating/fire risk)
 TEMP_LOW_WARN_C = -20       # temp below this -> cold warning (battery drain, equipment stress)
 TEMP_LOW_CRITICAL_C = -40   # temp below this -> critical cold alert (frostbite/hypothermia/equipment failure)
 BATTERY_LOW_PCT = 20        # battery below this -> low battery alert
@@ -79,6 +79,23 @@ sqlite_conn.commit()
 # ----------------------------------------------------------------
 # node_id -> {temp, humidity, battery, last_seen, status, history: [battery readings]}
 nodes_state = {}
+
+# ----------------------------------------------------------------
+# Demo kill-switch — for the live judging demo, fakes a node going dark
+# on command. sensor_simulator.py is a separate OS process we don't
+# control the lifecycle of (and don't want to — it's still generating
+# realistic drift/battery drain in the background), so instead of
+# signaling it directly, we intercept its POSTs here: while a node_id is
+# in g_killed_nodes, incoming POST /data for it is accepted (so the
+# simulator sees a normal 200 and doesn't trip its own error handling)
+# but diverted into kill_buffer instead of updating live state. GET
+# /nodes reports it offline immediately (not after OFFLINE_THRESHOLD_SEC)
+# so judges see the reaction the instant the button is pressed. Revive
+# flushes kill_buffer through the same _ingest_reading() path the
+# simulator's own reconnect-flush uses, so the sync animation fires too.
+# ----------------------------------------------------------------
+g_killed_nodes = set()
+DEMO_KILLABLE_NODES = {"node_2", "node_3", "node_4", "node_5"}  # node_1 is real hardware
 
 
 def classify_status(node_id, data, last_seen_age):
@@ -217,6 +234,21 @@ def receive_data():
     node_id = data["node_id"]
     now = time.time()
 
+    if node_id in g_killed_nodes:
+        # Demo kill switch is on for this node — buffer instead of
+        # applying live, same shape as the simulator's own offline
+        # buffer, so /demo/revive-node/<node_id> can flush it through
+        # the normal batch path below. Still returns 200 so the
+        # simulator's own retry/offline logic doesn't get involved.
+        state = nodes_state.setdefault(node_id, {"battery_history": []})
+        buffer = state.setdefault("kill_buffer", [])
+        if "batch" in data:
+            buffer.extend(data["batch"])
+        else:
+            buffer.append(data)
+        state["kill_buffer"] = buffer[-50:]  # cap, same as sensor_simulator.py's own buffer
+        return jsonify({"status": "ok", "buffered": True}), 200
+
     # Handle batched store-and-forward flush from an offline node
     if "batch" in data:
         readings = data["batch"]
@@ -286,8 +318,15 @@ def get_nodes():
 
     # Simulated nodes (node_2 - node_5)
     for node_id, state in nodes_state.items():
-        age = now - state.get("last_seen", 0)
-        status = "red" if age > OFFLINE_THRESHOLD_SEC else state.get("status", "green")
+        if node_id in g_killed_nodes:
+            # Force offline immediately rather than waiting out
+            # OFFLINE_THRESHOLD_SEC — the demo wants an instant reaction
+            # the moment KILL NODE is pressed.
+            age = OFFLINE_THRESHOLD_SEC + 1
+            status = "red"
+        else:
+            age = now - state.get("last_seen", 0)
+            status = "red" if age > OFFLINE_THRESHOLD_SEC else state.get("status", "green")
 
         last_sync_at = state.get("last_sync_at")
         is_syncing = last_sync_at is not None and (now - last_sync_at) < SYNC_DISPLAY_SEC
@@ -307,6 +346,45 @@ def get_nodes():
             "sync_backlog": state.get("last_sync_count", 0) if is_syncing else 0,
         })
     return jsonify(result)
+
+
+@app.route("/demo/kill-node/<node_id>", methods=["POST"])
+def demo_kill_node(node_id):
+    """Live-demo kill switch. node_1 is real Pi hardware, not ours to fake
+    offline from here — only node_2..node_5 (sensor_simulator.py) qualify."""
+    if node_id not in DEMO_KILLABLE_NODES:
+        return jsonify({"error": f"{node_id} can't be killed — only {sorted(DEMO_KILLABLE_NODES)} are demo nodes"}), 400
+
+    g_killed_nodes.add(node_id)
+    nodes_state.setdefault(node_id, {"battery_history": []})
+    write_alert(node_id, "node_offline", f"{node_id}: manually disconnected (demo)", "critical")
+    write_event(node_id, "killed", f"{node_id} killed for demo")
+    return jsonify({"status": "ok", "node_id": node_id, "killed": True}), 200
+
+
+@app.route("/demo/revive-node/<node_id>", methods=["POST"])
+def demo_revive_node(node_id):
+    """Clears the kill switch and flushes whatever POSTs piled up in
+    kill_buffer while the node was "dead", through the same
+    _ingest_reading() path the simulator's own reconnect-flush uses — so
+    GET /nodes reports is_syncing and the dashboard plays the sync
+    animation, same as a real store-and-forward reconnect."""
+    if node_id not in DEMO_KILLABLE_NODES:
+        return jsonify({"error": f"{node_id} can't be revived — only {sorted(DEMO_KILLABLE_NODES)} are demo nodes"}), 400
+
+    g_killed_nodes.discard(node_id)
+    state = nodes_state.setdefault(node_id, {"battery_history": []})
+    buffer = state.pop("kill_buffer", [])
+    now = time.time()
+
+    for r in buffer:
+        _ingest_reading(node_id, r, now)
+
+    state["last_sync_count"] = len(buffer)
+    state["last_sync_at"] = now
+    state["last_seen"] = now
+    write_event(node_id, "revived", f"{node_id} revived for demo — {len(buffer)} buffered readings flushed")
+    return jsonify({"status": "ok", "node_id": node_id, "revived": True, "flushed": len(buffer)}), 200
 
 
 def _alert_sort_key(alert):

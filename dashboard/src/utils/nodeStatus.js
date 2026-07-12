@@ -5,9 +5,9 @@
 // Backend has no separate "warning" tier for high temp (jumps straight to
 // critical at TEMP_ALERT_C), so warning/critical high are set equal here.
 const TEMP_WARNING_LOW_C = -20;   // matches TEMP_LOW_WARN_C
-const TEMP_WARNING_HIGH_C = 20;   // matches TEMP_ALERT_C
+const TEMP_WARNING_HIGH_C = 32;   // matches TEMP_ALERT_C
 const TEMP_CRITICAL_LOW_C = -40;  // matches TEMP_LOW_CRITICAL_C
-const TEMP_CRITICAL_HIGH_C = 20;  // matches TEMP_ALERT_C
+const TEMP_CRITICAL_HIGH_C = 32;  // matches TEMP_ALERT_C
 const HUMIDITY_HIGH_PCT = 80;     // frontend-only nicety — backend doesn't alert on this
 const BATTERY_LOW_PCT = 20;       // matches BATTERY_LOW_PCT
 

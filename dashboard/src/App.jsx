@@ -3,6 +3,7 @@ import NodeStatusCard from "./components/NodeStatusCard";
 import AlertFeed from "./components/AlertFeed";
 import TelemetryPanel from "./components/TelemetryPanel";
 import ArcticMap from "./components/ArcticMap";
+import DemoControls from "./components/DemoControls";
 
 const CONNECTION_META = {
   connecting: { label: "CONNECTING...", dot: "bg-amber-500 animate-pulse", text: "text-amber-500" },
@@ -29,6 +30,10 @@ function App() {
           <span className={`font-mono text-xs uppercase tracking-widest ${meta.text}`}>{meta.label}</span>
         </div>
       </header>
+
+      <div className="mb-6">
+        <DemoControls nodes={nodes} />
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-6 mb-6">
         {hasData ? (

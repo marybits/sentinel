@@ -150,3 +150,7 @@ vite.config.ts.timestamp-*
 # Pi complains about an untracked sentinel.db blocking the merge, that's the
 # leftover local DB file — move/delete it, don't re-commit it.
 *.db
+
+# Python bytecode cache — also got committed by accident.
+__pycache__/
+*.pyc
