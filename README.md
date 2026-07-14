@@ -7,7 +7,7 @@ Built at **cuHacking 2026** · [marybits/sentinel](https://github.com/marybits/s
 
 ---
 
-## ❄️ The Problem
+## The Problem
 
 Canada's Arctic covers 4 million square kilometers and includes over 220 remote communities living with **zero reliable internet infrastructure**. The Canadian Rangers patrol these regions blind: they have no means to monitor the environment, detect perimeter threats, or receive alerts when equipment fails.
 
@@ -15,7 +15,7 @@ Traditional monitoring systems are built on a fragile paradigm: they stop workin
 
 ---
 
-## 🛡️ The Solution
+## The Solution
 
 Sentinel is a resilient edge-AI sensor network built around a single principle: **the system must keep working, even when the connection doesn't.**
 
@@ -40,7 +40,7 @@ Sentinel is a resilient edge-AI sensor network built around a single principle: 
 
 ---
 
-## 🧠 Key Features
+## Features
 
 - **Edge AI** — TFLite neural network runs directly on QNX, classifying movement as `approaching`, `passing by`, or `static/noise` from ultrasonic distance history
 - **Offline-first** — field nodes buffer readings locally when the hub is unreachable and flush automatically on reconnect (store-and-forward)
@@ -50,7 +50,7 @@ Sentinel is a resilient edge-AI sensor network built around a single principle: 
 
 ---
 
-## ⚡ Why QNX?
+## Why QNX?
 
 Linux processes tasks *when it has time*. QNX guarantees task execution within a **precise, deterministic timeframe**, same RTOS used in defense, aerospace, and medical devices.
 
@@ -58,7 +58,7 @@ When a perimeter breach is detected, QNX reacts in microseconds. That's the requ
 
 ---
 
-## 🔧 Tech Stack
+## Tech Stack
 
 | Layer | Technology |
 |---|---|
@@ -70,7 +70,7 @@ When a perimeter breach is detected, QNX reacts in microseconds. That's the requ
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 **Hub (on Pi via SSH):**
 ```bash
@@ -93,7 +93,7 @@ cd dashboard && npm install && npm run dev
 
 ---
 
-## 🗺️ Roadmap
+## Roadmap
 
 - **ESP-NOW** — direct device-to-device radio, no WiFi router needed
 - **LoRa** — multi-kilometer range for true Arctic deployment
